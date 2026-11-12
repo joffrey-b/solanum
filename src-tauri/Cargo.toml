@@ -1,0 +1,181 @@
+[package]
+name = "solanum"
+version = "1.0.0"
+description = "Solanum SSH Client"
+authors = ["joffrey-b"]
+license = "GPL-3.0-only"
+edition = "2021"
+rust-version = "1.89"
+
+# Library + binary dual target. The Tauri Builder, command registry, and
+# state setup live in `src/lib.rs::run()`. The bin entry point (`src/main.rs`)
+# is a one-liner that calls `solanum_lib::run()` on desktop; on Android
+# Tauri's `#[mobile_entry_point]` attr on `run()` generates the JNI glue and
+# the bin is never built. `cdylib` is what Gradle dlopens from the APK.
+[lib]
+name = "solanum_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+# Compile crypto + compression dependencies with full optimization even
+# in `cargo build` (debug). Without this, `npm run tauri dev` runs the
+# Argon2 KDF unoptimised — vault unlock takes 5-10x longer (1.5-3 s vs
+# 200-400 ms) because the inner mixing loops aren't vectorised. The
+# rest of our own code stays debug-buildable, so iteration speed and
+# panic-on-overflow assertions are unaffected.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.aes-gcm]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.ghash]
+opt-level = 3
+[profile.dev.package.zstd-safe]
+opt-level = 3
+[profile.dev.package.zstd-sys]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
+# What ships: `tauri build` and the Android build both use this profile.
+# scripts/release-rustflags.mjs adds the other half of keeping build-machine
+# paths out of a binary (strip does not touch panic locations).
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+# Spelled out because it matters: a panicking task must end that task, not
+# every open session.
+panic = "unwind"
+# Solanum's own arithmetic behaves as it does in dev and in the tests: a size
+# bug stops there instead of carrying on with a wrong number. Numbers a server
+# sends already go through saturating arithmetic (monitor.rs). Dependencies stay
+# as their authors ship them, so crypto and compression loops pay nothing.
+overflow-checks = true
+
+[profile.release.package."*"]
+overflow-checks = false
+
+[dependencies]
+tauri = { version = "2.1", features = [] }
+# tauri-plugin-opener replaces the `open` crate for URL opening — the latter
+# is excluded on Android (no equivalent crate), so before this plugin the
+# About-panel "open repo / website" buttons returned a literal "external
+# URLs not wired on Android yet" error. The plugin bridges to ACTION_VIEW
+# on Android and to xdg-open / open / start on desktop, so the same Rust
+# call works everywhere. We keep `open` for file/folder open-with calls
+# (Live Edit, Open in Explorer) which are desktop-only by design and
+# already cfg-gated.
+tauri-plugin-opener = "2"
+# Terminal copy/paste needs real OS clipboard access, not the webview's own
+# navigator.clipboard: WebKitGTK's Async Clipboard API readText() only
+# reliably returns text the page itself just wrote, and denies reading
+# clipboard content set by any other application. This plugin talks to the
+# OS clipboard over Tauri's own IPC instead, so it isn't subject to that (or
+# any other webview's) clipboard permission model. Cross-platform like
+# tauri-plugin-opener above, not desktop-only like window-state below — it
+# has (text-only) Android/iOS support too, which a lighter-weight
+# desktop-only crate like `arboard` alone doesn't provide, so it stays the
+# right choice despite pulling in its own optional image-clipboard support
+# (and that support's image/png/tiff/etc. dependency chain) that we never
+# use: it's enabled via the plugin's own Cargo.toml, not something a
+# consumer crate can opt out of via feature flags here.
+tauri-plugin-clipboard-manager = "2"
+hex = "0.4"
+# Compact transport for coalesced terminal output over the Tauri event bridge
+# (a raw Vec<u8> serializes as a ~4x-bloated JSON number array). Already in the
+# dependency tree via tauri/russh, so this direct dep adds no new crate.
+base64 = "0.22"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+# TCP-level keepalive on the SSH transport sockets (poor-network resilience).
+# Already in the tree transitively via tokio — a direct dep adds no new crates.
+socket2 = "0.6"
+rusqlite = { version = "0.41", features = ["bundled", "serialize"] }
+# `zeroize`: derive_key clears Argon2's working memory after use (N-005).
+argon2 = { version = "0.5", features = ["zeroize"] }
+aes-gcm = "0.10"
+rand = "0.8"
+directories = "5.0"
+# SSH stack. russh's `ring` backend is selected on purpose: `ring` is already
+# in the tree through rustls (reqwest), whereas the default `aws-lc-rs` would
+# add a second crypto library that needs cmake/NASM on Windows and Android.
+# `rsa` keeps RSA host/user keys (pure Rust, no OpenSSL) and legacy KEX/MAC
+# are built in, so no OpenSSL, Perl or vendored libcrypto is needed anymore.
+russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2"] }
+tokio-socks = "0.5"
+async-http-proxy = { version = "1.2", features = ["runtime-tokio"] }
+russh-sftp = "3.0"
+notify = "6.1.1"
+# Debounces filesystem events so we don't try to upload a file mid-write.
+# Mirror watcher uses this — events for the same path within 500ms collapse
+# to a single action, which both eliminates partial uploads and keeps
+# rapid-fire editor saves (e.g. vim's swap-then-rename pattern) from
+# generating spurious traffic. Pairs cleanly with the `notify` 6.x crate
+# we already use elsewhere.
+notify-debouncer-mini = "0.4"
+# Used by the mirror module to stamp downloaded files with the remote's
+# mtime. Without it, every freshly-downloaded file has local mtime = now,
+# which would make the next dry-run treat the local copy as "newer" and
+# offer to re-upload it back. set_file_mtime is a single syscall and
+# `filetime` is the standard crate for it (works on Rust 1.70 — std::fs
+# alternatives need 1.75+).
+filetime = "0.2"
+# Content-hash compare in the mirror's initial reconciliation. We trust
+# size+mtime as a quick equality check (matching rsync's default), but
+# when sizes match and mtimes drift we hash both sides and only count
+# the files as different if the digests actually disagree. SHA-256 is
+# overkill for a "same or not?" question but it's already pulled in
+# transitively by russh/ssh-key, so making the dep explicit costs nothing.
+sha2 = "0.10"
+regex = "1.10"
+# HTTP client. Its ONLY use is the anonymous GitHub release check in about.rs
+# (no cloud, no account, no telemetry). rustls-tls so we don't drag in OpenSSL
+# on Windows builds; json to parse GitHub's release list.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# The vault compresses the SQLite serialisation with zstd before encrypting.
+# Real profiles compress ~50-70% (lots of repeated SQL+JSON structure), so
+# the on-disk vault shrinks correspondingly.
+zstd = { version = "0.13", default-features = false }
+# Zeroize-on-drop wrappers for the master vault key and the decompressed
+# SQLite plaintext. Without this, secrets stay in the heap until allocator
+# reuse — long enough for a swap file / crash dump to capture them. We
+# wrap only the things that survive past one function call; transient
+# String/Vec passed as args to argon2/aes-gcm are zeroized internally by
+# those crates.
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+
+# ---------------------------------------------------------------------------
+# Desktop-only deps. These crates either don't compile on Android at all
+# (rfd — native file dialog) or have no meaningful mobile equivalent
+# (tauri-plugin-window-state — mobile windows aren't resizable/movable;
+# open — opening a file in the user's "default desktop app" doesn't map to
+# Android's intent system; portable-pty — there's no "local shell" concept
+# in Tauri's Android sandbox). Their call sites in `lib.rs`, `about.rs` and
+# `local_shell.rs` are wrapped in `#[cfg(not(target_os = "android"))]`, so
+# the Android build doesn't need any of these to compile.
+# ---------------------------------------------------------------------------
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tauri-plugin-window-state = "2"
+rfd = "0.14"
+# shellexecute-on-windows: `that_detached` uses ShellExecuteExW instead of
+# `cmd /c start`, which expands %VAR% inside file names (open_guard.rs).
+open = { version = "5.1", features = ["shellexecute-on-windows"] }
+# Local (non-SSH) shell tab. One API for a real PTY on Linux/macOS and
+# ConPTY on Windows 10 1809+, resize-aware — the same crate wezterm itself
+# uses, so this is a well-trodden path rather than hand-rolled platform FFI.
+portable-pty = "0.9.0"
+
+# Linux only: the native "Open this file?" / "Start a local shell?"
+# confirmation (open_guard.rs) is a GTK dialog, modal to the app window, with
+# Cancel as the default. Tauri already builds exactly this gtk version on
+# Linux, so this adds no new crate. rfd's Linux message dialog is a zenity
+# subprocess that can neither default to Cancel nor turn off Pango markup.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"

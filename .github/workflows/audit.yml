@@ -1,0 +1,41 @@
+name: Dependency audit
+
+# Looks for published security advisories in the Rust and npm dependencies, weekly, whenever a lockfile
+# changes, and on demand. It fails on a new vulnerability, or a crate newly found unsound or yanked
+# (unmaintained ones are listed only), so it shows as a failed run. Named here, each with its reason in
+# SECURITY.md: RUSTSEC-2023-0071 (rsa, no fixed release), RUSTSEC-2026-0495 (russh's SSH-agent server, which
+# Solanum does not use; russh 0.65 after 1.0), RUSTSEC-2024-0429 (glib 0.18, fixed only in releases the
+# GTK 3 stack does not use).
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - src-tauri/Cargo.lock
+      - package-lock.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      # The whole tree, dev tools too: they run on the machine that builds the release.
+      - name: npm audit
+        run: npm audit
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --file src-tauri/Cargo.lock --deny unsound --deny yanked --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0495 --ignore RUSTSEC-2024-0429

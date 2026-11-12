@@ -1,0 +1,49 @@
+Solanum is free software, distributed under the GNU General Public
+License, version 3 only (GPL-3.0-only). The full text is in the file LICENSE.
+
+Copyright (C) 2026 joffrey-b
+
+Solanum began as a fork of "Submarine" by Sina Xhpm
+(https://github.com/SinaXhpm/Submarine), which is licensed under the MIT
+License. The MIT License is compatible with the GPL, so the combined work is
+distributed under GPL-3.0-only, but the MIT License requires that the original
+copyright and permission notice stay with every copy of the code derived from
+it. That notice is reproduced here in full:
+
+----------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 Sina Xhpm
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----------------------------------------------------------------------------
+
+The MIT License above covers the code that comes from the original project.
+It grants no rights to that project's name or logo, which belong to its author
+and are not part of what is licensed here. "Solanum" is a nod to a character in the
+video game Outer Wilds; this project is not affiliated with or endorsed by its
+creators or publisher, and uses none of the game's artwork.
+
+Third-party components (Rust crates, npm packages and the Android libraries in
+the APK) keep their own licenses, all of which are compatible with the GPL. The
+five monospace fonts are separate works under the SIL Open Font License 1.1,
+shipped alongside the program. All of them are listed, with their license texts,
+in THIRD-PARTY-LICENSES.txt, which ships with every build.

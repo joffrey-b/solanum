@@ -1,0 +1,722 @@
+name: Release
+
+# Fires when you push a tag like v0.1.0. The job builds Solanum on
+# Windows, macOS, and Ubuntu, stamps the tag's version into Cargo.toml
+# and tauri.conf.json so the bundled binary's version matches the tag,
+# and uploads the installers/bundles as a draft GitHub Release.
+#
+# Triggering a release: locally run
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# A tag or a typed-in version never goes into a script as ${{ }}: the runner
+# would paste it into the script's text before bash reads it, and a tag may
+# legally contain $, ; and backticks. The preflight job validates the value and
+# everything after it reads shell variables.
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual button on the Actions tab — useful for sanity checks without
+  # cutting a real release. Choose any version string; nothing is published
+  # unless `publish_release` is true.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.0.1-test" # Tauri refuses 0.0.0 for Android
+      publish_release:
+        description: "Attach artifacts to a GitHub Release"
+        required: false
+        default: "false"
+
+# Read-only by default: everything that runs npm, Cargo or Gradle build steps
+# gets a token that cannot change the repository. Only the release job, which
+# runs nothing from the dependencies, may write.
+permissions:
+  contents: read
+
+# Faster, cheaper CI builds. Incremental compilation costs time + disk in
+# clean-checkout environments where there's nothing to be incremental
+# against; -D warnings would be great here but breaks too many crates,
+# so leave at default.
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # Decides the version once, and refuses to spend an hour of builds on a
+  # release that is wrong before it starts.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_strict: ${{ steps.version.outputs.version_strict }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Strict-semver form (version_strict): everything from the first '-'
+      # stripped. Windows MSI (WiX) rejects non-numeric pre-release identifiers
+      # (`optional pre-release identifier in app version must be numeric-only`),
+      # and Arch's makepkg rejects hyphens in pkgver outright. Both fall back to
+      # this shortened string for stamping / pkgver; the other targets (Android,
+      # macOS, .deb, .rpm, AppImage, NSIS) still see the full string so a dev
+      # build's artefacts self-identify as e.g. "0.2.37-dev".
+      - name: Resolve and validate the version
+        id: version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RAW="$INPUT_VERSION"
+          else
+            RAW="$REF_NAME"
+          fi
+          # A refused value is not printed: the log reads ::commands:: too.
+          if [[ ! "$RAW" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::The tag or version input must look like v1.2.3 or v1.2.3-rc.1."
+            exit 1
+          fi
+          # Strip leading "v" — Cargo + Tauri want bare semver.
+          VERSION="${RAW#v}"
+          {
+            echo "version=$VERSION"
+            echo "version_strict=${VERSION%%-*}"
+            echo "tag=v$VERSION"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: $VERSION"
+
+      - name: Install Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+
+      # A pushed tag must match the manifests (a pre-release of that version
+      # is fine). A manual run may use any version, as the input above says.
+      - name: Check the manifests
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            node scripts/check-versions.mjs
+          else
+            node scripts/check-versions.mjs --tag "$TAG"
+          fi
+
+      - name: Check the Gradle wrapper is an official one
+        uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows: ships .msi (WiX) and .exe (NSIS). Both let the user
+          # double-click to install with no extra friction.
+          - platform: windows-latest
+            os_name: windows
+            bundles: "msi,nsis"
+            rust_target: x86_64-pc-windows-msvc
+
+          # macOS Apple Silicon. We produce both:
+          #   - Solanum.app (zipped → unzip + double-click, no DMG drag)
+          #   - Solanum_x.y.z_aarch64.dmg (classic DMG installer)
+          # Intel Macs are not supported: Rosetta 2 runs x86-64 programs on
+          # Apple Silicon, not the other way round, so this arm64 build cannot
+          # run on them. The dedicated macos-13 (Intel) matrix entry was dropped
+          # because GitHub's Intel macOS runner pool is so scarce that jobs would
+          # routinely hit the 45-minute queue timeout and fail the release.
+          - platform: macos-latest
+            os_name: macos-arm64
+            bundles: "app,dmg"
+            rust_target: aarch64-apple-darwin
+
+          # Linux: ship four flavours so users on any major distro can
+          # double-click an installer that matches their package manager:
+          #   - .deb   → Debian / Ubuntu / Mint
+          #   - .rpm   → Fedora / RHEL / openSUSE
+          #   - .AppImage → distro-agnostic, no install required
+          # And a separate Arch step further down produces .pkg.tar.zst
+          # via makepkg inside an Arch Docker container (Tauri's bundler
+          # has no native Arch backend).
+          - platform: ubuntu-22.04
+            os_name: linux-x64
+            bundles: "deb,rpm,appimage"
+            rust_target: x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.platform }}
+
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      VERSION_STRICT: ${{ needs.preflight.outputs.version_strict }}
+      BUNDLES: ${{ matrix.bundles }}
+      OS_NAME: ${{ matrix.os_name }}
+      RUST_TARGET: ${{ matrix.rust_target }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: npm
+
+      # Stamp the version into Cargo.toml and tauri.conf.json so the
+      # bundled binary's about/version metadata matches the git tag.
+      # Without this, a v0.2.0 tag would still produce installers
+      # showing "0.1.0" inside Windows Add/Remove Programs and macOS's
+      # Get Info pane. Cargo.lock gets it too, or --locked below would
+      # refuse. Uses Node to avoid the cross-platform sed/awk quoting maze.
+      - name: Stamp version into manifests
+        shell: bash
+        run: |
+          # Windows bundles MSI in the same job as NSIS; MSI requires
+          # a strict semver (no non-numeric pre-release) so we stamp
+          # the sanitised form for the whole Windows job. Other
+          # platforms keep the full string.
+          if [[ "$BUNDLES" == *msi* ]]; then
+            STAMP="$VERSION_STRICT"
+          else
+            STAMP="$VERSION"
+          fi
+          echo "Stamping manifests with $STAMP"
+          STAMP_VERSION="$STAMP" node -e "
+            const fs=require('fs');
+            const v=process.env.STAMP_VERSION;
+            // Cargo.toml: only the package.version line — leave dep versions alone.
+            const cargo=fs.readFileSync('src-tauri/Cargo.toml','utf8');
+            const next=cargo.replace(/^version *= *\".*\"/m, 'version = \"'+v+'\"');
+            fs.writeFileSync('src-tauri/Cargo.toml', next);
+            // Cargo.lock: only Solanum's own entry. Git may check out CRLF on Windows.
+            const lock=fs.readFileSync('src-tauri/Cargo.lock','utf8');
+            const own=/(name = \"solanum\"\r?\nversion = \")[^\"]*/;
+            if(!own.test(lock)) throw new Error('no solanum entry in Cargo.lock');
+            fs.writeFileSync('src-tauri/Cargo.lock', lock.replace(own, '\$1'+v));
+            // tauri.conf.json: top-level version key.
+            const conf=JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8'));
+            conf.version=v;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2)+'\n');
+            console.log('Stamped version', v);
+          "
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      # Linux-only: WebKit + AppImage tooling + rpmbuild. The Tauri Linux
+      # build links webkit2gtk-4.1, ships an AppImage built via
+      # `linuxdeploy` (needs librsvg + libsoup3), and now also produces an
+      # .rpm which requires the `rpm` package's `rpmbuild` binary.
+      # The runner image's preinstalled packages lag behind the archive, and
+      # the AppImage copies them: upgrade first, so it carries the libraries'
+      # current versions (security updates included), which are also the only
+      # ones whose source the archive still serves (the sources step below).
+      # A package whose new version says "snap" only installs a snap: the
+      # runner has firefox as a deb, and Ubuntu's newer firefox package is
+      # the snap installer. The runner cannot reach the snap store, so such an
+      # upgrade retries for an hour. Nothing in the build uses them: they are
+      # held, by the version the upgrade would install (field 3 of
+      # `apt list --upgradable`: name/suites version arch [upgradable from: x]).
+      # A changed configuration file keeps the runner's version instead of
+      # asking (a question would wait on stdin until the time limit), and
+      # services the upgrade touches (MySQL, Apache, snapd) are not restarted:
+      # a policy-rc.d that refuses every start, for this step only.
+      - name: Install Linux deps
+        if: matrix.os_name == 'linux-x64'
+        timeout-minutes: 25
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          if [ ! -e /usr/sbin/policy-rc.d ]; then
+            printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+            sudo chmod 755 /usr/sbin/policy-rc.d
+            trap 'sudo rm -f /usr/sbin/policy-rc.d' EXIT
+          fi
+          sudo apt-get update
+          apt list --upgradable 2>/dev/null | awk -F '[/ ]' '$3 ~ /snap/ { print $1 }' | xargs -r sudo apt-mark hold
+          sudo -E apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade -y
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            patchelf \
+            file \
+            rpm
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Keep build-machine paths out of the binaries
+        shell: bash
+        run: |
+          flags="$(node scripts/release-rustflags.mjs)"
+          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
+
+      # We deliberately do NOT run `npm run build` here — tauri-action
+      # invokes the `beforeBuildCommand` defined in tauri.conf.json
+      # (which is `npm run build`) before the Rust build, so a manual
+      # invocation would just duplicate work and risk version drift
+      # between the two passes.
+      - name: Build Tauri bundles
+        # Every action in this file is pinned to a commit SHA (the tag is in the
+        # trailing comment), so a moved or hijacked tag can't change what runs.
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        with:
+          args: --target ${{ matrix.rust_target }} --bundles ${{ matrix.bundles }} -- --locked
+
+      - name: Check the binary holds no build-machine path
+        shell: bash
+        run: |
+          EXE=""
+          if [ "$OS_NAME" = "windows" ]; then EXE=".exe"; fi
+          node scripts/release-rustflags.mjs --check "src-tauri/target/$RUST_TARGET/release/solanum$EXE"
+
+      # The AppImage carries this machine's libraries (WebKitGTK, GTK, GLib and
+      # what they need): their licences go inside it, and the image is bundled
+      # again with them (N-038, see the script).
+      - name: Licences of the libraries in the AppImage
+        if: matrix.os_name == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="src-tauri/target/$RUST_TARGET/release/bundle/appimage"
+          node scripts/appimage-licenses.mjs --write "$dir" src-tauri/target/appimage-licenses
+          npx tauri bundle --target "$RUST_TARGET" --bundles appimage --config src-tauri/target/appimage-licenses/tauri.appimage.json
+          node scripts/appimage-licenses.mjs --check "$dir"
+          # The exact source of every package the notice lists, published next
+          # to the AppImage as <name>.AppImage.sources.tar (the notice says so).
+          # A package whose source the archive does not have stops the release.
+          # Source lines for the Ubuntu archive, written out: the runner reaches
+          # it through a mirror list (mirror+file:/etc/apt/apt-mirrors.txt), and
+          # its files carry no source lines to copy. The archive serves every
+          # pocket the runner installs from, security included.
+          . /etc/os-release
+          for pocket in "$VERSION_CODENAME" "$VERSION_CODENAME-updates" "$VERSION_CODENAME-security" "$VERSION_CODENAME-backports"; do
+            echo "deb-src http://archive.ubuntu.com/ubuntu $pocket main restricted universe multiverse"
+          done | sudo tee /etc/apt/sources.list.d/solanum-deb-src.list >/dev/null
+          sudo apt-get update -qq
+          mkdir -p appimage-sources
+          while read -r src ver; do
+            (cd appimage-sources && apt-get source --download-only -qq "$src=$ver" </dev/null)
+          done < src-tauri/target/appimage-licenses/sources.txt
+          image="$(ls "$dir"/*.AppImage)"
+          tar -cf "$image.sources.tar" -C appimage-sources .
+          ls -la "$image.sources.tar"
+
+      # Arch: Tauri's bundler has no native pacman backend, so we run
+      # makepkg ourselves inside an `archlinux:latest` container. The
+      # PKGBUILD in packaging/arch/ installs the already-built Tauri
+      # release binary plus a .desktop, an icon and the licence files from
+      # $startdir — no source download / no rebuild — so the result is the same binary
+      # users get from the .deb, just packaged for pacman. Compression
+      # stays at pacman's default (zstd at level 19, what every Arch
+      # mirror uses) — no custom XZ / no MAKEPKG_CONF tweaks.
+      - name: Build Arch package
+        if: matrix.os_name == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p arch-build
+          cp packaging/arch/PKGBUILD             arch-build/
+          cp packaging/arch/solanum.desktop    arch-build/
+          cp "src-tauri/target/$RUST_TARGET/release/solanum" arch-build/
+          cp src-tauri/icons/icon.png            arch-build/
+          cp LICENSE                             arch-build/
+          cp NOTICE                              arch-build/
+          cp THIRD-PARTY-LICENSES.txt            arch-build/
+
+          # Run makepkg in a throwaway Arch container. base-devel pulls in
+          # fakeroot/binutils/etc; we create an unprivileged build user
+          # because makepkg refuses to run as root. --skipinteg because
+          # the PKGBUILD has no source= entries (everything is local).
+          # --nodeps because the depends=() are RUNTIME-only (webkit2gtk-
+          # 4.1 / gtk3 / libsoup3 — what the user's machine needs to
+          # actually launch the app). package() doesn't compile or link
+          # anything; it just installs the already-built Tauri binary +
+          # .desktop + icon + licence files, so the dep check in the build container
+          # would only force us to download those packages for nothing.
+          # Arch's pkgver forbids hyphens (and colons, slashes, spaces).
+          # For a dev / rc / beta release the version we WANT to stamp
+          # is "0.2.37-dev" but pkgver has to be "0.2.37" or makepkg
+          # rejects the PKGBUILD with `pkgver is not allowed to contain
+          # colons, forward slashes, hyphens or whitespace`. Passing
+          # VERSION_STRICT keeps the pkg name usable; the file name
+          # inside the artefact bundle still says v${VERSION} because
+          # we compose that from $VERSION (with the pre-release intact)
+          # elsewhere in the workflow.
+          docker run --rm \
+            -v "$PWD/arch-build:/build" \
+            -w /build \
+            -e VERSION="$VERSION_STRICT" \
+            archlinux:latest \
+            bash -c '
+              set -e
+              pacman -Syu --noconfirm --needed base-devel sudo
+              useradd -m b
+              echo "b ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+              chown -R b:b /build
+              sudo -u b sed -i "s/^pkgver=.*/pkgver=$VERSION/" PKGBUILD
+              sudo -u b makepkg -f --noconfirm --skipinteg --nodeps
+            '
+
+      # macOS: zip the .app bundle so a user can download a single file
+      # and just double-click. No DMG drag-to-Applications dance.
+      - name: Zip macOS .app
+        if: startsWith(matrix.os_name, 'macos')
+        run: |
+          APP_DIR="src-tauri/target/$RUST_TARGET/release/bundle/macos"
+          cd "$APP_DIR"
+          # The .app folder is named after productName ("Solanum").
+          # Wrap it in a versioned zip for the release asset name.
+          ZIP_NAME="Solanum-v${VERSION}-${OS_NAME}.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "Solanum.app" "$ZIP_NAME"
+          echo "MAC_ZIP=$APP_DIR/$ZIP_NAME" >> "$GITHUB_ENV"
+
+      # Collect every artifact this job produced into one folder for upload.
+      - name: Stage artifacts (Windows)
+        if: matrix.os_name == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Get-ChildItem -Path "src-tauri/target/$env:RUST_TARGET/release/bundle" -Recurse -Include *.msi,*.exe |
+            Copy-Item -Destination artifacts/
+
+      - name: Stage artifacts (macOS)
+        if: startsWith(matrix.os_name, 'macos')
+        run: |
+          mkdir -p artifacts
+          cp "$MAC_ZIP" artifacts/
+          find "src-tauri/target/$RUST_TARGET/release/bundle/dmg" -name "*.dmg" -exec cp {} artifacts/ \; || true
+
+      - name: Stage artifacts (Linux)
+        if: matrix.os_name == 'linux-x64'
+        run: |
+          mkdir -p artifacts
+          # Tauri bundles land in target/.../release/bundle/{deb,rpm,appimage}/.
+          # Arch .pkg.tar.zst is in arch-build/ from the previous step.
+          find "src-tauri/target/$RUST_TARGET/release/bundle" \
+            \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.AppImage.sources.tar" \) \
+            -exec cp {} artifacts/ \;
+          find arch-build -maxdepth 1 -name "*.pkg.tar.zst" -exec cp {} artifacts/ \;
+          ls -la artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: solanum-${{ matrix.os_name }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  # Android: separate job because the setup (JDK 17 + Android SDK/NDK +
+  # Android Rust targets) is wholly different from the desktop matrix.
+  # Produces an unsigned universal release APK. It has no secrets: npm, Gradle
+  # and every crate's build script run here, and none of them should ever be
+  # able to read the signing key. The android-sign job below signs the result.
+  android:
+    needs: preflight
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      # Gradle's own daemon off (Tauri starts gradlew itself).
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Stamp version into manifests
+        shell: bash
+        run: |
+          node -e "
+            const fs=require('fs');
+            const v=process.env.VERSION;
+            const cargo=fs.readFileSync('src-tauri/Cargo.toml','utf8');
+            const next=cargo.replace(/^version *= *\".*\"/m, 'version = \"'+v+'\"');
+            fs.writeFileSync('src-tauri/Cargo.toml', next);
+            const lock=fs.readFileSync('src-tauri/Cargo.lock','utf8');
+            const own=/(name = \"solanum\"\r?\nversion = \")[^\"]*/;
+            if(!own.test(lock)) throw new Error('no solanum entry in Cargo.lock');
+            fs.writeFileSync('src-tauri/Cargo.lock', lock.replace(own, '\$1'+v));
+            const conf=JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8'));
+            conf.version=v;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2)+'\n');
+          "
+
+      - name: Install JDK 17
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: "platforms;android-36 build-tools;36.0.0 ndk;27.1.12297006"
+
+      - name: Install Rust with Android targets
+        # Only the two ABIs that ship in real Android phones — aarch64
+        # (modern arm64) and armv7 (older 32-bit arm). x86 / x86_64 are
+        # emulator-only and we explicitly drop them to keep APKs lean.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+          key: android
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Keep build-machine paths out of the binaries
+        run: |
+          flags="$(node scripts/release-rustflags.mjs --android)"
+          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
+
+      # Universal APK — single .apk users sideload from GitHub. Split APKs
+      # were tried in v0.2.18/v0.2.19 but Android rejects them as "invalid
+      # package" when installed standalone because split APKs need their
+      # matching base.apk installed at the same time (the Play Store
+      # mechanism). For direct sideload only a universal APK works.
+      #
+      # AAB was dropped in v0.2.30 — we don't ship through Google Play, so
+      # the .aab artifact was dead weight (users can't sideload it) and
+      # doubled the Android build time on CI. If Play Store distribution
+      # becomes a goal later, re-add `android:build:aab` to package.json
+      # and the matching find/copy loop here.
+      - name: Build Android APK
+        env:
+          # The version installed above. setup-android exports only the SDK's folder.
+          NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.1.12297006
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.1.12297006
+        run: npm run android:build
+
+      - name: Check the libraries hold no build-machine path
+        shell: bash
+        env:
+          # So the check also looks for the NDK's folder (release-rustflags.mjs).
+          NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.1.12297006
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.1.12297006
+        run: |
+          for lib in src-tauri/target/{aarch64-linux-android,armv7-linux-androideabi}/release/libsolanum_lib.so; do
+            node scripts/release-rustflags.mjs --check "$lib"
+          done
+
+      - name: Stage the unsigned APK
+        shell: bash
+        run: |
+          shopt -s nullglob
+          mkdir -p artifacts
+          # Without a keystore Gradle names its output *-unsigned.apk.
+          apks=(src-tauri/gen/android/app/build/outputs/apk/*/release/*-release-unsigned.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::Gradle produced no unsigned release APK."
+            exit 1
+          fi
+          cp "${apks[@]}" artifacts/
+          ls -la artifacts/
+
+      - name: Upload the unsigned APK
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: solanum-android-unsigned
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Signs what the android job built, and nothing else runs here: no checkout, no
+  # npm, no Gradle, only tools from the SDK. So no dependency's build step ever
+  # shares a job with the key.
+  #
+  # The four required secrets:
+  #   SOLANUM_KEYSTORE_B64        — base64 of the .jks
+  #   SOLANUM_KEYSTORE_PASSWORD   — keystore password
+  #   SOLANUM_KEY_ALIAS           — alias inside the keystore
+  #   SOLANUM_KEY_PASSWORD        — key password
+  android-sign:
+    needs: [preflight, android]
+    runs-on: ubuntu-22.04
+    permissions: {}
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Install JDK 17
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: "build-tools;36.0.0"
+
+      - name: Download the unsigned APK
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: solanum-android-unsigned
+          path: unsigned
+
+      # Fails loudly if a secret is missing: an unsigned APK is a file Android
+      # rejects at install with "package appears to be invalid". v1 + v2 + v3
+      # so the APK installs on every minSdk 24+ device: some Android variants
+      # reject v2-only APKs at install time. v4 needs a side-band .apk.idsig
+      # file that sideloading doesn't use. Alignment comes from Gradle (16 KB
+      # for native libraries) and is kept as it is.
+      - name: Sign and verify
+        shell: bash
+        env:
+          SOLANUM_KEYSTORE_B64: ${{ secrets.SOLANUM_KEYSTORE_B64 }}
+          SOLANUM_KEYSTORE_PASSWORD: ${{ secrets.SOLANUM_KEYSTORE_PASSWORD }}
+          SOLANUM_KEY_ALIAS: ${{ secrets.SOLANUM_KEY_ALIAS }}
+          SOLANUM_KEY_PASSWORD: ${{ secrets.SOLANUM_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          missing=()
+          [ -z "$SOLANUM_KEYSTORE_B64" ]      && missing+=("SOLANUM_KEYSTORE_B64")
+          [ -z "$SOLANUM_KEYSTORE_PASSWORD" ] && missing+=("SOLANUM_KEYSTORE_PASSWORD")
+          [ -z "$SOLANUM_KEY_ALIAS" ]         && missing+=("SOLANUM_KEY_ALIAS")
+          [ -z "$SOLANUM_KEY_PASSWORD" ]      && missing+=("SOLANUM_KEY_PASSWORD")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing GitHub Secrets required for signing: ${missing[*]}"
+            exit 1
+          fi
+
+          key_dir="$(mktemp -d)"
+          trap 'rm -rf "$key_dir"' EXIT
+          echo "$SOLANUM_KEYSTORE_B64" | base64 -d > "$key_dir/release.jks"
+          if [ ! -s "$key_dir/release.jks" ]; then
+            echo "::error::SOLANUM_KEYSTORE_B64 decoded to an empty file — verify the secret is valid base64."
+            exit 1
+          fi
+
+          tools="$ANDROID_SDK_ROOT/build-tools/36.0.0"
+          mkdir -p artifacts
+          apks=(unsigned/*-unsigned.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::No unsigned APK to sign."
+            exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            base="$(basename "$apk" -unsigned.apk)"
+            out="artifacts/Solanum-v${VERSION}-${base}.apk"
+            "$tools/zipalign" -c -P 16 4 "$apk"
+            "$tools/apksigner" sign \
+              --ks "$key_dir/release.jks" \
+              --ks-key-alias "$SOLANUM_KEY_ALIAS" \
+              --ks-pass env:SOLANUM_KEYSTORE_PASSWORD \
+              --key-pass env:SOLANUM_KEY_PASSWORD \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --v4-signing-enabled false \
+              --alignment-preserved true \
+              --out "$out" \
+              "$apk"
+            echo "--- apksigner verify $out ---"
+            # At the real minSdk (24) apksigner does not look at v1 at all, so
+            # ask as a device one version older would.
+            report="$("$tools/apksigner" verify --verbose --min-sdk-version 23 "$out")"
+            echo "$report"
+            for scheme in "v1 scheme (JAR signing)" "v2 scheme (APK Signature Scheme v2)" "v3 scheme (APK Signature Scheme v3)"; do
+              if ! grep -qF "Verified using $scheme: true" <<< "$report"; then
+                echo "::error::$out is not signed with $scheme."
+                exit 1
+              fi
+            done
+            "$tools/zipalign" -c -P 16 4 "$out"
+          done
+          ls -la artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: solanum-android
+          path: artifacts/*
+          if-no-files-found: error
+
+  # Gather every platform's artifacts and attach them to a GitHub Release.
+  # Skips when triggered via workflow_dispatch unless `publish_release=true`.
+  release:
+    needs: [preflight, build, android-sign]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true'
+    permissions:
+      contents: write # create the draft release
+      id-token: write # sign the attestation (Sigstore; no key is stored anywhere)
+      attestations: write # record the attestation
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+
+      # solanum-android-unsigned is in dist/ too. It must never reach a release:
+      # it is a file Android rejects at install.
+      - name: Flatten into a single folder
+        run: |
+          mkdir -p release-files
+          find dist -type f ! -name "*-unsigned.apk" \( \
+            -name "*.msi" -o -name "*.exe" \
+            -o -name "*.dmg" -o -name "*.app.zip" \
+            -o -name "*.AppImage" -o -name "*.AppImage.sources.tar" -o -name "*.deb" -o -name "*.rpm" \
+            -o -name "*.pkg.tar.zst" \
+            -o -name "*.apk" \
+            \) -exec cp {} release-files/ \;
+          ls -la release-files/
+
+      # Names without a folder, so `sha256sum -c SHA256SUMS` works next to the
+      # downloads. See "Verifying a download" in the README.
+      - name: Write SHA256SUMS
+        working-directory: release-files
+        run: |
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-files/*
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          name: Solanum ${{ needs.preflight.outputs.tag }}
+          draft: true
+          generate_release_notes: true
+          files: release-files/*

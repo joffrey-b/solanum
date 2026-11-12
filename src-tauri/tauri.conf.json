@@ -1,0 +1,49 @@
+{
+  "productName": "Solanum",
+  "version": "1.0.0",
+  "identifier": "io.github.joffrey-b.solanum",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+"app": {
+    "windows": [
+      {
+        "title": "Solanum",
+        "width": 1080,
+        "height": 720,
+        "minWidth": 820,
+        "minHeight": 600,
+        "decorations": false,
+        "transparent": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset: https://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: https://ipc.localhost; frame-src 'none'; object-src 'none'; base-uri 'self'",
+      "dangerousDisableAssetCspModification": ["style-src"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "joffrey-b",
+    "copyright": "Copyright (C) 2026 joffrey-b",
+    "license": "GPL-3.0-only",
+    "licenseFile": "../LICENSE",
+    "resources": {
+      "../LICENSE": "licenses/LICENSE",
+      "../NOTICE": "licenses/NOTICE",
+      "../THIRD-PARTY-LICENSES.txt": "licenses/THIRD-PARTY-LICENSES.txt"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

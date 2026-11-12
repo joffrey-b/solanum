@@ -1,0 +1,51 @@
+{
+  "name": "solanum",
+  "version": "1.0.0",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check:ipc": "node scripts/check-ipc.mjs",
+    "check:versions": "node scripts/check-versions.mjs",
+    "licenses": "node scripts/generate-licenses.mjs",
+    "check:licenses": "node scripts/generate-licenses.mjs --check",
+    "test:util": "node scripts/test-util.mjs",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "android:init": "tauri android init",
+    "android:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android-dev.ps1",
+    "android:dev:raw": "tauri android dev",
+    "android:build:apk": "tauri android build --apk --target aarch64 armv7 -- --locked",
+    "android:build": "npm run android:build:apk"
+  },
+  "dependencies": {
+    "@fontsource/cascadia-code": "^5.3.0",
+    "@fontsource/fira-code": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "@fontsource/source-code-pro": "^5.3.0",
+    "@tauri-apps/api": "^2.11.0",
+    "lucide-react": "^0.300.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0",
+    "xterm-addon-search": "^0.13.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.2.0",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.5.32",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.0.0",
+    "vite": "^7.3.7"
+  }
+}

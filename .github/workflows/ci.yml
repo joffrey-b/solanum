@@ -1,0 +1,104 @@
+name: CI
+
+# Checks every push to main and every pull request: clippy and the Rust unit tests (Linux and Windows)
+# and the frontend typecheck + build. Nothing here publishes anything — releases are built by release.yml
+# when a v* tag is pushed. Dependency advisories are checked separately by audit.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  frontend:
+    name: Frontend (typecheck, IPC and version checks, util tests, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run check:ipc
+      - run: npm run check:versions
+      - run: npm run test:util
+      - run: npm run build
+
+  licenses:
+    name: Third-party licence list matches the lockfiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          cache: npm
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - run: npm ci
+      - run: npm run check:licenses
+
+  rust:
+    name: Rust clippy and tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: bash scripts/ci-linux-deps.sh
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+      # tauri::generate_context! embeds the frontend bundle at compile time and refuses to build if the
+      # folder is missing. The tests never look inside it, so a stub is enough (the real bundle is
+      # built by the frontend job above and by the release workflow).
+      - name: Stub the frontend bundle
+        run: |
+          mkdir -p dist
+          echo '<!doctype html><title>ci</title>' > dist/index.html
+      # Lints that point at bugs stop the build. Style stays a warning for now. Both operating systems:
+      # a good part of the code is behind cfg(windows).
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness -D clippy::suspicious -D clippy::perf
+      - name: Unit tests
+        working-directory: src-tauri
+        run: cargo test --locked --lib
+      # Starts a child process, which would disturb the profile-lock tests beside it: run alone.
+      - name: Argon2 memory refusal (Linux, alone)
+        if: runner.os == 'Linux'
+        working-directory: src-tauri
+        run: cargo test --locked --lib -- --ignored --exact vault_format_tests::argon2_memory_the_process_cannot_get_is_refused_not_an_abort
