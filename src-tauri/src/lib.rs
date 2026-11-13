@@ -9767,14 +9767,14 @@ struct ImportedHost {
 /// the main thread, and only if it is a regular file of at most 1 MiB, so a
 /// FIFO, a device or a huge file can't hang or exhaust the app.
 ///
-/// Desktop-only. Android has no meaningful `~/.ssh/config` path and its
-/// import story goes through profile export/import instead — we return a
-/// clear message rather than pretending to look somewhere.
+/// Desktop-only. Android has no meaningful `~/.ssh/config` path; its import
+/// window offers only the pasted source (`parse_client_import`), and this
+/// returns a clear message rather than pretending to look somewhere.
 #[tauri::command]
 async fn parse_ssh_config() -> Result<Vec<ImportedHost>, String> {
     #[cfg(target_os = "android")]
     {
-        Err("Not available on Android — use export/import instead".into())
+        Err("There is no ~/.ssh/config on Android: paste a PuTTY, MobaXterm or JSON export instead".into())
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -11189,6 +11189,10 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 shut_down(app);
+                // N-035: never let tao's `exit` leave a half torn-down process
+                // for the next start to land in.
+                #[cfg(target_os = "android")]
+                android::end_process_after_shutdown();
             }
         });
 }

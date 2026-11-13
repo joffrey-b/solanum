@@ -4,7 +4,7 @@
 //! login step). Test-only; nothing here touches the network.
 
 use russh::keys::{Algorithm, EcdsaCurve, PrivateKey, PublicKey, PublicKeyOrCertificate};
-use russh::server::{self, Auth, Msg, Response, Session};
+use russh::server::{self, Auth, Msg, PublicKeyOffer, Response, Session, VerifiedPublicKey};
 use russh::{client, Channel, ChannelId, MethodKind, MethodSet, Sig};
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
@@ -206,9 +206,9 @@ impl server::Handler for TestServer {
         Ok(self.step(MethodKind::Password, user == USER && password == PASSWORD))
     }
 
-    async fn auth_publickey_offered(&mut self, _user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+    async fn auth_publickey_offered(&mut self, _user: &str, offer: PublicKeyOffer<'_>) -> Result<Auth, Self::Error> {
         self.stall_if_asked().await?;
-        let known = self.script.user_key.as_ref().is_some_and(|k| k.key_data() == key.key_data());
+        let known = self.script.user_key.as_ref().is_some_and(|k| k.key_data() == offer.public_key.key_data());
         if known && self.wanted() == Some(MethodKind::PublicKey) {
             Ok(Auth::Accept)
         } else {
@@ -216,9 +216,9 @@ impl server::Handler for TestServer {
         }
     }
 
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+    async fn auth_publickey(&mut self, user: &str, key: VerifiedPublicKey<'_>) -> Result<Auth, Self::Error> {
         self.stall_if_asked().await?;
-        let known = self.script.user_key.as_ref().is_some_and(|k| k.key_data() == key.key_data());
+        let known = self.script.user_key.as_ref().is_some_and(|k| k.key_data() == key.public_key.key_data());
         Ok(self.step(MethodKind::PublicKey, user == USER && known))
     }
 

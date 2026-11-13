@@ -23,7 +23,7 @@ test("the cargo home is mapped last, so it wins when it is inside the checkout",
   assert.equal(r.stdout.trim(), `--remap-path-prefix=${root}=/solanum --remap-path-prefix=${cargoHome}=/cargo`);
 });
 
-test("--android adds the link flags Tauri would otherwise pass: RUSTFLAGS replaces them", () => {
+test("--android adds the link flags Tauri would otherwise pass (RUSTFLAGS replaces them) and 16 KB pages (N-037)", () => {
   const root = resolve("/work/solanum");
   const cargoHome = resolve("/cargo-home");
   const env = { ...process.env, CARGO_HOME: cargoHome };
@@ -31,8 +31,14 @@ test("--android adds the link flags Tauri would otherwise pass: RUSTFLAGS replac
   assert.equal(r.status, 0, r.stderr);
   assert.equal(
     r.stdout.trim(),
-    `--remap-path-prefix=${root}=/solanum --remap-path-prefix=${cargoHome}=/cargo -Clink-arg=-landroid -Clink-arg=-llog -Clink-arg=-lOpenSLES`,
+    `--remap-path-prefix=${root}=/solanum --remap-path-prefix=${cargoHome}=/cargo -Clink-arg=-landroid -Clink-arg=-llog -Clink-arg=-lOpenSLES -Clink-arg=-Wl,-z,max-page-size=16384`,
   );
+});
+
+test("the 16 KB page flag is for Android only", () => {
+  const r = spawnSync(process.execPath, [SCRIPT, "--root", resolve("/work/solanum")], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!r.stdout.includes("max-page-size"), r.stdout);
 });
 
 test("without CARGO_HOME it uses the default under the home folder", () => {

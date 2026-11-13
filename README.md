@@ -6,7 +6,7 @@
   <p>
     <a href="https://github.com/joffrey-b/solanum/releases"><img alt="release" src="https://img.shields.io/github/v/release/joffrey-b/solanum?include_prereleases" /></a>
     <a href="https://github.com/joffrey-b/solanum/releases"><img alt="downloads" src="https://img.shields.io/github/downloads/joffrey-b/solanum/total" /></a>
-    <a href="https://github.com/joffrey-b/solanum/actions"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/joffrey-b/solanum/release.yml" /></a>
+    <a href="https://github.com/joffrey-b/solanum/actions"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/joffrey-b/solanum/ci.yml?branch=main" /></a>
     <img alt="platforms" src="https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux%20%7C%20android-blue" />
     <img alt="license" src="https://img.shields.io/badge/license-GPLv3-blue" />
   </p>
@@ -29,7 +29,7 @@ Solanum is a free, open-source SSH and SFTP client. Each server gets one tabbed 
 - **Local shells** next to your SSH sessions: PowerShell, Command Prompt, WSL or Git Bash on Windows, your own shell on Linux and macOS
 - **Network gear welcome**: Cisco switches and other devices that allow one channel per connection get a clean terminal session, and old SHA-1 algorithms can be allowed for the servers that need them
 - **Encrypted vault**: your profiles are sealed with Argon2id and AES-256-GCM, on your device only
-- **Imports** from PuTTY, MobaXterm and OpenSSH config
+- **Host import** from an OpenSSH config, PuTTY or MobaXterm: Add server → **Import hosts**
 - **Native and light**: Rust and Tauri, no bundled Chromium
 
 ## Features
@@ -49,7 +49,7 @@ More screenshots are in [docs/screenshots](docs/screenshots).
 - Key, password, keyboard-interactive and **two-step logins** (a key, then a password or a code)
 - **Run on connect**: commands typed into the first terminal when the server connects
 - **Autostart** servers when Solanum opens, and **Quick connect**: type an address and go (the server is added to your list for next time)
-- **Import** hosts from an OpenSSH config, PuTTY (`.reg`), MobaXterm (`.mxtsessions`) or a JSON list
+- **Import hosts** (Add server → Import hosts) from an OpenSSH config, PuTTY (`.reg`), MobaXterm (`.mxtsessions`) or a JSON list: each host's name, address, port and user, never a password or key
 - **Terminal only**, for devices that allow one channel per connection: Solanum recognises Cisco devices by itself and offers to remember any other, so SFTP, Info and Docker step aside instead of failing
 - **Local shell tabs** (desktop): your login shell or another from your system's list, PowerShell, PowerShell 7, Command Prompt, WSL or Git Bash on Windows. Each one asks first, in a system dialog
 - A dropped connection reconnects by itself and keeps your scrollback. A session the server ends (`exit`, an idle logout) stays ended until you press **R** or **Reconnect**
@@ -184,7 +184,7 @@ The same Rust core, SSH stack and vault format as on the desktop, for phones, ta
 - What a server sends is treated as untrusted: file names cannot leave the folder you download to, programs are never opened, and opening a file or starting a local shell asks first in a system dialog
 - On Linux the window runs in WebKit's sandbox where the system allows it (the `.deb`, `.rpm` and Arch packages on a normal desktop; not the AppImage)
 
-**What leaves your machine:** your SSH connections, to the hosts you configured, and one anonymous request to GitHub's releases API to see whether a newer version exists, once per launch and when you press **Check for updates** in About. It sends nothing from your vault; GitHub sees your IP address, the time and the version asking. It cannot be turned off, but blocking it affects nothing else.
+**What leaves your machine:** your SSH connections, to the hosts you configured, and one anonymous request to GitHub's releases API to see whether a newer version exists, once per launch and when you press **Check for updates** in About. It sends nothing from your vault; GitHub sees your IP address, the time and the version asking. It cannot be turned off, but blocking it affects nothing else. Installing on Windows can add one connection: where Microsoft's WebView2 runtime is missing (some Windows 10 installs), the installer downloads it from Microsoft ([details](SECURITY.md#known-limitations)).
 
 [SECURITY.md](SECURITY.md) has the rest: how to report a vulnerability, what Solanum protects and what it does not, its defences in detail, and its **known limitations**.
 
@@ -208,7 +208,7 @@ Each profile is one encrypted file in your system's app-data folder; your server
 
 ### I used the original Submarine. Can I bring my profiles over?
 
-No, by design: Solanum has its own profile format and does not open the original cloud-enabled Submarine's files (it says so and leaves the file untouched). Start a new profile and use **Import** on the Servers page to bring your hosts over from an OpenSSH config, PuTTY or MobaXterm.
+No, by design: Solanum has its own profile format and does not open the original cloud-enabled Submarine's files (it says so and leaves the file untouched). Start a new profile and enter your hosts again, or, if you also have them in an OpenSSH config, PuTTY or MobaXterm, import them from there: Add server → **Import hosts**.
 
 ### Is Solanum on the Play Store?
 

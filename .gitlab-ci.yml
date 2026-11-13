@@ -173,8 +173,7 @@ clippy-windows:
 # Dependency advisories, weekly from the schedule (and by hand, where a failure only informs). A scheduled run fails on
 # a new vulnerability, or a crate newly found unsound or yanked (unmaintained ones are listed only), so it turns the
 # pipeline red. Named here, each with its reason in SECURITY.md: RUSTSEC-2023-0071, the `rsa` timing side channel (no
-# fixed release); RUSTSEC-2026-0495, russh's SSH-agent server (Solanum uses no agent code; russh 0.65 after 1.0);
-# RUSTSEC-2024-0429, glib 0.18's iterator (fixed only in releases the GTK 3 stack does not use).
+# fixed release); RUSTSEC-2024-0429, glib 0.18's iterator (fixed only in releases the GTK 3 stack does not use).
 audit-cargo:
   stage: test
   extends: .rust-linux
@@ -184,7 +183,7 @@ audit-cargo:
       allow_failure: true
   script:
     - cargo install cargo-audit --locked
-    - cargo audit --file src-tauri/Cargo.lock --deny unsound --deny yanked --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0495 --ignore RUSTSEC-2024-0429
+    - cargo audit --file src-tauri/Cargo.lock --deny unsound --deny yanked --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0429
 
 audit-npm:
   stage: test
@@ -296,8 +295,9 @@ build-android:
     - npm run android:build:apk
     - node scripts/release-rustflags.mjs --check src-tauri/target/aarch64-linux-android/release/libsolanum_lib.so
     - node scripts/release-rustflags.mjs --check src-tauri/target/armv7-linux-androideabi/release/libsolanum_lib.so
-    # Google Play and 16 KB-page phones need 0x4000 on arm64; shown here, not enforced yet.
-    - '"$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -lW src-tauri/target/aarch64-linux-android/release/libsolanum_lib.so | grep LOAD'
+    # N-037: 16 KB-page phones and Google Play need every LOAD segment aligned to 0x4000 (the flag comes from
+    # release-rustflags.mjs --android and applies to both ABIs).
+    - node scripts/check-elf-alignment.mjs src-tauri/target/aarch64-linux-android/release/libsolanum_lib.so src-tauri/target/armv7-linux-androideabi/release/libsolanum_lib.so
     - mkdir -p apk-unsigned
     - cp src-tauri/gen/android/app/build/outputs/apk/*/release/*-release-unsigned.apk apk-unsigned/
   # Runs before the artifacts are collected, which are outside this folder. The disk is not large.

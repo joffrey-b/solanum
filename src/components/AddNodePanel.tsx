@@ -45,16 +45,23 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
   // open on empty results so the user gets an explicit "nothing to import"
   // message rather than a silent no-op.
   // Open the modal and immediately try the SSH-config path — that's the
-  // most common source on desktop. If it errors (Android, no config file,
+  // most common source on desktop. If it errors (no config file,
   // permissions), the user just switches to the "Paste" tab and drops in
-  // their PuTTY/MobaXterm/JSON export instead.
+  // their PuTTY/MobaXterm/JSON export instead. Android has no
+  // ~/.ssh/config, so there the window opens on the paste source and
+  // shows no tabs: an SSH-config tab could only show an error.
   const openImportModal = async () => {
     setImportOpen(true);
-    setImportSource("ssh");
     setImportPasteText("");
     setImportError(null);
     setImportHosts([]);
     setImportSelected(new Set());
+    if (IS_ANDROID) {
+      setImportSource("paste");
+      setImportLoading(false);
+      return;
+    }
+    setImportSource("ssh");
     setImportLoading(true);
     try {
       const hosts = await invoke<ImportedHost[]>("parse_ssh_config");
@@ -222,19 +229,16 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
           <div className="flex items-center gap-2">
             {/* Import only makes sense when creating a fresh row — editing an
                 existing server is a rename/reconfigure flow, not an import.
-                Available on Android now that the modal supports a "Paste
-                PuTTY / MobaXterm / JSON" source that doesn't need a local
-                ~/.ssh/config. The SSH-config tab still errors gracefully
-                there — the user just picks the paste tab. */}
+                Available on Android too, where the window offers only the
+                "Paste PuTTY / MobaXterm / JSON" source (no ~/.ssh/config). */}
             {!isEditMode && (
               <button
                 onClick={openImportModal}
-                title="Import from ~/.ssh/config"
+                title="Import hosts from an OpenSSH config (~/.ssh/config), PuTTY (.reg export), MobaXterm (.mxtsessions) or a JSON list"
                 className="h-8 px-2.5 flex items-center gap-1.5 text-[11px] font-bold text-primary bg-primary/10 border border-primary/30 hover:bg-primary/20 rounded-xl transition-all"
               >
                 <Download size={12} />
-                <span className="hidden sm:inline">Import from ~/.ssh/config</span>
-                <span className="sm:hidden">Import</span>
+                Import hosts
               </button>
             )}
             <button onClick={onClose} className="w-8 h-8 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-xl transition-all shadow-inner">
@@ -753,7 +757,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               <div className="flex items-center gap-2">
                 <Download size={14} className="text-primary" />
                 <h3 id="ssh-import-title" className="text-[12px] font-black uppercase tracking-widest text-zinc-100">
-                  Import SSH hosts
+                  Import hosts
                 </h3>
               </div>
               <button
@@ -770,7 +774,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                     paste  → drop text from PuTTY, MobaXterm, or a JSON
                              export; Rust auto-detects the format so the
                              user doesn't need to say which client it came
-                             from. */}
+                             from.
+                Android shows no selector: it has only the paste source. */}
+            {!IS_ANDROID && (
             <div className="px-4 py-2 border-b border-white/5 flex items-center gap-1 shrink-0">
               <button
                 onClick={() => switchImportSource("ssh")}
@@ -795,6 +801,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 Paste PuTTY / MobaXterm / JSON
               </button>
             </div>
+            )}
 
             {/* Body — one of loading / error / empty / list. */}
             <div className="flex-1 overflow-y-auto custom-scrollbar p-3">

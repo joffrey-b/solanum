@@ -3,9 +3,8 @@ name: Dependency audit
 # Looks for published security advisories in the Rust and npm dependencies, weekly, whenever a lockfile
 # changes, and on demand. It fails on a new vulnerability, or a crate newly found unsound or yanked
 # (unmaintained ones are listed only), so it shows as a failed run. Named here, each with its reason in
-# SECURITY.md: RUSTSEC-2023-0071 (rsa, no fixed release), RUSTSEC-2026-0495 (russh's SSH-agent server, which
-# Solanum does not use; russh 0.65 after 1.0), RUSTSEC-2024-0429 (glib 0.18, fixed only in releases the
-# GTK 3 stack does not use).
+# SECURITY.md: RUSTSEC-2023-0071 (rsa, no fixed release) and RUSTSEC-2024-0429 (glib 0.18, fixed only in
+# releases the GTK 3 stack does not use).
 on:
   schedule:
     - cron: "0 6 * * 1"
@@ -38,4 +37,4 @@ jobs:
       - name: cargo audit
         run: |
           cargo install cargo-audit --locked
-          cargo audit --file src-tauri/Cargo.lock --deny unsound --deny yanked --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0495 --ignore RUSTSEC-2024-0429
+          cargo audit --file src-tauri/Cargo.lock --deny unsound --deny yanked --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0429

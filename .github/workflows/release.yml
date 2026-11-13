@@ -482,6 +482,25 @@ jobs:
         with:
           packages: "platforms;android-36 build-tools;36.0.0 ndk;27.1.12297006"
 
+      # The runner comes with several NDKs, and Tauri's CLI builds with the newest one in the SDK
+      # whatever NDK_HOME says: the 1.0.0 APK was built with NDK 30.0, not the 27.1 named here and
+      # used by GitLab (so the path check below looked for the wrong folder). Only the pinned one stays.
+      - name: Keep only the pinned NDK
+        shell: bash
+        run: |
+          pinned=27.1.12297006
+          ndk="$ANDROID_SDK_ROOT/ndk"
+          # The image installed them, maybe as another user: sudo (passwordless on GitHub's runners).
+          sudo find "$ndk" -mindepth 1 -maxdepth 1 ! -name "$pinned" -exec rm -rf {} +
+          sudo rm -rf "$ANDROID_SDK_ROOT/ndk-bundle"
+          if [ "$(ls "$ndk")" != "$pinned" ]; then
+            echo "::error::$ndk should hold only NDK $pinned: $(ls "$ndk" | tr '\n' ' ')"
+            exit 1
+          fi
+          for var in ANDROID_NDK ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK_LATEST_HOME NDK_HOME; do
+            echo "$var=$ndk/$pinned" >> "$GITHUB_ENV"
+          done
+
       - name: Install Rust with Android targets
         # Only the two ABIs that ship in real Android phones — aarch64
         # (modern arm64) and armv7 (older 32-bit arm). x86 / x86_64 are
@@ -533,6 +552,12 @@ jobs:
           for lib in src-tauri/target/{aarch64-linux-android,armv7-linux-androideabi}/release/libsolanum_lib.so; do
             node scripts/release-rustflags.mjs --check "$lib"
           done
+
+      # N-037: 16 KB-page phones and Google Play need every LOAD segment aligned to 0x4000
+      # (-z max-page-size=16384, from release-rustflags.mjs --android).
+      - name: Check the libraries are aligned for 16 KB pages
+        shell: bash
+        run: node scripts/check-elf-alignment.mjs src-tauri/target/{aarch64-linux-android,armv7-linux-androideabi}/release/libsolanum_lib.so
 
       - name: Stage the unsigned APK
         shell: bash

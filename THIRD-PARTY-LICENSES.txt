@@ -449,7 +449,7 @@ rfd 0.14.1  |  MIT  |  [240]
 ring 0.17.14  |  Apache-2.0 AND ISC  |  [241] [242] [243]
 rsa 0.10.0-rc.18  |  MIT OR Apache-2.0  |  [3] [4]
 rusqlite 0.41.1  |  MIT  |  [175]
-russh 0.63.3  |  Apache-2.0  |  [17]
+russh 0.65.1  |  Apache-2.0  |  [17]
     Ships no licence file; the standard text is given. Authors: Pierre-Étienne Meunier. Source: https://github.com/warp-tech/russh
 russh-cryptovec 0.62.0  |  Apache-2.0  |  [17]
     Ships no licence file; the standard text is given. Authors: Pierre-Étienne Meunier, Eugeny <e@ajenti.org. Source: https://github.com/warp-tech/russh

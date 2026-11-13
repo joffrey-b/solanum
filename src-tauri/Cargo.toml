@@ -1,6 +1,6 @@
 [package]
 name = "solanum"
-version = "1.0.0"
+version = "1.0.1"
 description = "Solanum SSH Client"
 authors = ["joffrey-b"]
 license = "GPL-3.0-only"
@@ -108,7 +108,7 @@ directories = "5.0"
 # add a second crypto library that needs cmake/NASM on Windows and Android.
 # `rsa` keeps RSA host/user keys (pure Rust, no OpenSSL) and legacy KEX/MAC
 # are built in, so no OpenSSL, Perl or vendored libcrypto is needed anymore.
-russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
 tokio-socks = "0.5"
 async-http-proxy = { version = "1.2", features = ["runtime-tokio"] }
 russh-sftp = "3.0"

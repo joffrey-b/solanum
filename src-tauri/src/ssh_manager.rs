@@ -718,7 +718,10 @@ impl client::Handler for ClientHandler {
     }
 
     /// Says so when the key exchange settled on a legacy algorithm (possible
-    /// only for a server whose legacy setting is on, F-076).
+    /// only for a server whose legacy setting is on, F-076). Since russh 0.65
+    /// this runs after every key exchange, re-keys included (one an hour), so
+    /// each notice here must be said once per connection: `weak_reported`, and
+    /// `note_server_ident`, which is true only when it sets the limit.
     async fn kex_done(
         &mut self,
         _shared_secret: Option<&[u8]>,

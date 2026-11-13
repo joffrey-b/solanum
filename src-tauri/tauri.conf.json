@@ -1,6 +1,6 @@
 {
   "productName": "Solanum",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "identifier": "io.github.joffrey-b.solanum",
   "build": {
     "beforeDevCommand": "npm run dev",

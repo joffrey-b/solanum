@@ -29,6 +29,28 @@ pub async fn android_keep_alive(app: tauri::AppHandle, sessions: u32) -> Result<
 #[cfg(not(target_os = "android"))]
 const ANDROID_ONLY: &str = "Only on Android.";
 
+/// Ends the process at once, after `shut_down` (N-035). On Android the app
+/// exits when its Activity is destroyed (tao reports the window gone and the
+/// runtime exits with it), and tao then calls `std::process::exit`, which runs
+/// the C and C++ static destructors while other threads still run: the
+/// process can stay behind half torn down ("pthread_mutex_lock called on a
+/// destroyed mutex"), and the next start of Solanum lands in it and aborts.
+/// `_exit` skips those destructors, so the next start always gets a fresh
+/// process. Nothing is lost: `shut_down` has saved the vault and stopped
+/// everything, and the kernel releases the profile and staging-root locks.
+///
+/// `_exit` is Bionic's own (POSIX); declaring it here spares a direct `libc`
+/// dependency for one call.
+#[cfg(target_os = "android")]
+pub(crate) fn end_process_after_shutdown() -> ! {
+    unsafe extern "C" {
+        fn _exit(status: std::ffi::c_int) -> !;
+    }
+    // SAFETY: `_exit` takes a plain integer and never returns; ending the
+    // process without running destructors is the point.
+    unsafe { _exit(0) }
+}
+
 /// Settings > "Hide Solanum from screenshots and Recents": whether the window
 /// carries Android's `FLAG_SECURE` (screenshots, screen recordings, casting
 /// and the Recents preview show it blank). On by default; the Kotlin side

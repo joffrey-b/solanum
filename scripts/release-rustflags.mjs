@@ -64,5 +64,10 @@ for (const path of [root, cargoHome]) {
 const flags = [`--remap-path-prefix=${root}=/solanum`, `--remap-path-prefix=${cargoHome}=/cargo`];
 if (process.argv.includes("--android")) {
   flags.push("-Clink-arg=-landroid", "-Clink-arg=-llog", "-Clink-arg=-lOpenSLES");
+  // N-037: 16 KB-page phones load a library only when its segments are
+  // aligned to 16 KB, and Google Play requires it for apps that target
+  // Android 15+. NDK 27's linker still defaults to 4 KB; the CI jobs check the
+  // result with scripts/check-elf-alignment.mjs.
+  flags.push("-Clink-arg=-Wl,-z,max-page-size=16384");
 }
 console.log(flags.join(" "));
