@@ -188,6 +188,7 @@ const TerminalView = ({
   suppressResize = false,
   containerExec,
   localShell,
+  serialPort,
   connectionEpoch = 0,
   serverId = 0,
   serverName = "",
@@ -257,6 +258,9 @@ const TerminalView = ({
   /// is still required even here, since it's still used for event scoping
   /// and command-history stamping, just against a synthetic local session.
   localShell?: { shellIndex?: number; shellName?: string; cwd?: string };
+  /// When set, this terminal is a saved serial server's port (schema 7):
+  /// Rust reads the port and line settings from the vault by `serverId`.
+  serialPort?: { serverId: number };
   /// Bumped by the parent SessionView on every successful reconnect.
   /// When the value changes we re-open a fresh PTY against the new SSH
   /// handle WITHOUT disposing xterm — the user keeps their scroll-back
@@ -381,6 +385,8 @@ const TerminalView = ({
   // Same mirroring, same reason, for a local (non-SSH) shell tab.
   const localShellRef = useRef(localShell);
   useEffect(() => { localShellRef.current = localShell; }, [localShell]);
+  const serialPortRef = useRef(serialPort);
+  useEffect(() => { serialPortRef.current = serialPort; }, [serialPort]);
   // Last connectionEpoch we acted on. Initial mount's PTY is opened by
   // the main effect, so we should NOT re-open on the first run of the
   // reconnect effect — only on subsequent value changes.
@@ -527,6 +533,7 @@ const TerminalView = ({
     if (attachOnly) return;
     const ce = containerExecRef.current;
     const ls = localShellRef.current;
+    const sp = serialPortRef.current;
     const opened = ce
       ? invoke<string | null>('open_container_terminal', {
           sessionId,
@@ -545,6 +552,12 @@ const TerminalView = ({
           shellIndex: ls.shellIndex ?? 0,
           cwd: ls.cwd,
           logFilePath: sessionLogPathFor(serverName || 'terminal'),
+        })
+      : sp
+      ? invoke<string | null>('open_serial_terminal', {
+          terminalId,
+          serverId: sp.serverId,
+          logFilePath: sessionLogPathFor(serverName || 'serial'),
         })
       : invoke<string | null>('open_terminal', {
           sessionId,
@@ -1165,6 +1178,15 @@ const TerminalView = ({
             }
             term.writeln(`\x1b[31mFailed to open local shell: ${e}\x1b[0m`);
             markSessionEnded('Session failed to start');
+          });
+        } else if (serialPort) {
+          whenOpened(invoke<string | null>('open_serial_terminal', {
+            terminalId,
+            serverId: serialPort.serverId,
+            logFilePath: sessionLogPathFor(serverName || 'serial'),
+          }), e => {
+            term.writeln(`\x1b[31mCould not open the serial port: ${e}\x1b[0m`);
+            markSessionEnded('Port not opened');
           });
         } else {
           whenOpened(invoke<string | null>('open_terminal', {

@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { Zap, X, AlertTriangle, KeyRound, Lock } from "lucide-react";
 import PasswordField from "./PasswordField";
+import SerialPortFields from "./SerialPortFields";
+import { IS_ANDROID } from "../util/platform";
+import { SerialSettings, defaultSerial, serialProblem } from "../util/serialSettings";
 
 // Quick Connect: the auth bundle lives in component state, gets passed to
 // DesktopApp via onConnect, and the resulting session carries it through to
@@ -22,9 +25,16 @@ interface Props {
   isOpen: boolean;
   onClose: () => void;
   onConnect: (auth: QuickAuth) => void;
+  /// A serial port (desktop only): saved as a node, then opened. Rejects
+  /// with the reason the node could not be saved.
+  onSerialConnect?: (settings: SerialSettings) => Promise<void>;
 }
 
-const QuickConnectModal = ({ isOpen, onClose, onConnect }: Props) => {
+const QuickConnectModal = ({ isOpen, onClose, onConnect, onSerialConnect }: Props) => {
+  const serialOffered = !!onSerialConnect && !IS_ANDROID;
+  const [kind, setKind] = useState<"ssh" | "serial">("ssh");
+  const [serial, setSerial] = useState<SerialSettings>(defaultSerial());
+  const [busy, setBusy] = useState(false);
   const [host, setHost] = useState("");
   const [port, setPort] = useState<number>(22);
   const [username, setUsername] = useState("root");
@@ -44,8 +54,21 @@ const QuickConnectModal = ({ isOpen, onClose, onConnect }: Props) => {
 
   const close = () => { reset(); onClose(); };
 
-  const connect = () => {
+  const connect = async () => {
     setErr(null);
+    if (kind === "serial" && onSerialConnect) {
+      const problem = serialProblem(serial);
+      if (problem) { setErr(problem); return; }
+      setBusy(true);
+      try {
+        await onSerialConnect({ ...serial, port: serial.port.trim() });
+      } catch (e) {
+        setErr(String(e));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
     if (!host.trim()) { setErr("Host is required"); return; }
     if (!username.trim()) { setErr("Username is required"); return; }
     if (!port || port < 1 || port > 65535) { setErr("Port must be 1–65535"); return; }
@@ -82,6 +105,38 @@ const QuickConnectModal = ({ isOpen, onClose, onConnect }: Props) => {
             </div>
           )}
 
+          {serialOffered && (
+            <div className="flex items-center gap-1.5 bg-white/[0.03] border border-white/10 rounded-lg p-1" role="radiogroup" aria-label="Connection">
+              {(["ssh", "serial"] as const).map((k) => (
+                <button
+                  key={k}
+                  role="radio"
+                  aria-checked={kind === k}
+                  onClick={() => { setKind(k); setErr(null); }}
+                  className={`flex-1 h-7 rounded text-[10.5px] font-bold uppercase tracking-wider transition-colors ${
+                    kind === k ? "bg-primary/20 text-primary" : "text-zinc-400 hover:text-zinc-100"
+                  }`}
+                >
+                  {k === "ssh" ? "SSH" : "Serial"}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {kind === "serial" && serialOffered ? (
+            <>
+              <SerialPortFields
+                value={serial}
+                onChange={setSerial}
+                inputClass="w-full h-9 px-3 bg-zinc-900/60 border border-white/10 rounded-lg text-[12.5px] text-zinc-50 outline-none focus:border-primary/50"
+                labelClass="text-[10px] font-bold text-zinc-300 uppercase tracking-wider ml-0.5"
+                foldLineSettings
+              />
+              <p className="text-[10.5px] text-zinc-400 leading-snug pt-1">
+                This port is saved as a node in your root directory for reuse. Edit or remove it anytime from the node grid.
+              </p>
+            </>
+          ) : (<>
           {/* Host + port */}
           <div className="grid grid-cols-4 gap-2">
             <div className="col-span-3 space-y-1">
@@ -180,15 +235,17 @@ const QuickConnectModal = ({ isOpen, onClose, onConnect }: Props) => {
           <p className="text-[10.5px] text-zinc-400 leading-snug pt-1">
             This host is saved as a node in your root directory for reuse. Edit or remove it anytime from the node grid.
           </p>
+          </>)}
         </div>
 
         {/* Footer */}
         <div className="shrink-0 px-5 py-3 border-t border-white/5 flex items-center gap-2">
           <button
             onClick={connect}
-            className="flex-1 h-10 rounded-lg text-[11.5px] font-bold uppercase tracking-wider bg-primary text-black hover:shadow-[0_0_20px_rgba(var(--primary),0.3)] flex items-center justify-center gap-2"
+            disabled={busy}
+            className="flex-1 h-10 rounded-lg disabled:opacity-50 text-[11.5px] font-bold uppercase tracking-wider bg-primary text-black hover:shadow-[0_0_20px_rgba(var(--primary),0.3)] flex items-center justify-center gap-2"
           >
-            <Zap size={14} /> Connect
+            <Zap size={14} /> {kind === "serial" && serialOffered ? "Open port" : "Connect"}
           </button>
           <button onClick={close} className="h-10 px-4 rounded-lg text-[11.5px] font-bold uppercase tracking-wider bg-white/5 text-zinc-200 border border-white/10 hover:bg-white/10">
             Cancel

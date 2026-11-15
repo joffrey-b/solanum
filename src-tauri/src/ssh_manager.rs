@@ -88,6 +88,9 @@ pub enum TerminalCommand {
     Data(Vec<u8>),
     /// Output bytes the window has processed (`terminal_io::MAX_UNACKED`).
     Ack(usize),
+    /// Send break (`serial_send_break`): queued behind the keys before it,
+    /// answered when done. Terminals that are not serial ports refuse it.
+    Break(oneshot::Sender<Result<(), String>>),
 }
 
 #[derive(Clone, Copy, Debug)]

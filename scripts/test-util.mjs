@@ -2,7 +2,7 @@
 // typed-line tracker and echo check, paste and snippet keys, highlighting),
 // the dialog queue, listener cleanup, the Docker live-log run, per-profile
 // storage keys, what a terminal-only session shows, the update check's
-// once-per-launch rule, and the file browser's sizes.
+// once-per-launch rule, the file browser's sizes, and the serial settings.
 // The modules are TypeScript: esbuild (installed with Vite) bundles each one
 // for Node, next to the tests in tests/util, and `node --test` runs them.
 // Then the tests in tests/scripts: the repository's own scripts, and the
@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const MODULES = ["secretPrompt", "terminalInput", "highlight", "dialogQueue", "tauriEvents", "liveStream", "profileStorage", "terminalOnly", "updateCheck", "formatSize"];
+const MODULES = ["secretPrompt", "terminalInput", "highlight", "dialogQueue", "tauriEvents", "liveStream", "profileStorage", "terminalOnly", "updateCheck", "formatSize", "serialSettings"];
 const TESTS = join(ROOT, "tests", "util");
 const SCRIPT_TESTS = join(ROOT, "tests", "scripts");
 

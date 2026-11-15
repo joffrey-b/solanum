@@ -1,6 +1,6 @@
 [package]
 name = "solanum"
-version = "1.0.1"
+version = "1.0.2"
 description = "Solanum SSH Client"
 authors = ["joffrey-b"]
 license = "GPL-3.0-only"
@@ -171,6 +171,10 @@ open = { version = "5.1", features = ["shellexecute-on-windows"] }
 # ConPTY on Windows 10 1809+, resize-aware — the same crate wezterm itself
 # uses, so this is a well-trodden path rather than hand-rolled platform FFI.
 portable-pty = "0.9.0"
+# Serial consoles (serial.rs): COM ports and /dev ttys as a terminal. Without
+# the default `libudev` feature it lists Linux ports from /sys/class/tty, so
+# no system library is added to the build or the AppImage. MPL-2.0.
+serialport = { version = "4.10", default-features = false }
 
 # Linux only: the native "Open this file?" / "Start a local shell?"
 # confirmation (open_guard.rs) is a GTK dialog, modal to the app window, with

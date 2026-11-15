@@ -21,6 +21,7 @@ import { useTauriEvent } from "./hooks/useTauriEvent";
 import { unlistenWhenReady } from "./util/tauriEvents";
 import { dropLegacyKeys, setStorageProfile } from "./util/profileStorage";
 import { IS_ANDROID } from "./util/platform";
+import { SerialSettings, defaultSerial, isSerialServer, sameSerial, serialFromServer, serialProblem, serialSummary } from "./util/serialSettings";
 import { Sidebar } from "./components/Sidebar";
 import { PinnedPanel } from "./components/PinnedPanel";
 import { NodeGrid } from "./components/NodeGrid";
@@ -29,6 +30,7 @@ import TerminalView from "./components/TerminalView";
 import SettingsPanel from "./components/SettingsPanel";
 import { SessionView } from "./components/SessionView";
 import LocalShellView from "./components/LocalShellView";
+import SerialView from "./components/SerialView";
 import LocalShellModal, { LocalShellOpts } from "./components/LocalShellModal";
 import MonitoringPanel from "./components/MonitoringPanel";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
@@ -48,7 +50,10 @@ const appWindow = getCurrentWindow();
 // shell — serverId stays 0 (same orphaned-history sentinel quick connect
 // already uses) and `localShell` carries the shell/cwd instead; it renders
 // via LocalShellView, not SessionView (see that component's own comment).
-type Session = { id: string; serverId: number; serverName: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null; kind?: 'local'; localShell?: LocalShellOpts };
+// A fourth, `kind: 'serial'`, is a saved serial server's port (schema 7):
+// `serverId` is the saved node (Rust reads the port and settings from the
+// vault), `serial` only labels the header; it renders via SerialView.
+type Session = { id: string; serverId: number; serverName: string; mirrors?: string; runOnConnect?: string; quickAuth?: QuickAuth | null; kind?: 'local' | 'serial'; localShell?: LocalShellOpts; serial?: { port: string; summary: string } };
 
 const hexToRgb = (hex: string) => {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -242,6 +247,10 @@ function DesktopApp() {
     // A plain terminal, with no SFTP browser, live info or Docker. Saved with
     // the node by save_server, or from the notice a limited host gets.
     terminalOnly: false,
+    // `ssh`, or `serial` for a COM port or /dev tty (schema 7, desktop only).
+    connectionType: "ssh" as "ssh" | "serial",
+    // A serial server's port and line settings (PuTTY's 9600 8N1 by default).
+    serial: defaultSerial() as SerialSettings,
     // True only after the user typed into the password field on this form
     // instance. If still false at save time, the backend uses
     // `preserve_password` to keep the existing DB column. Without this
@@ -500,7 +509,7 @@ function DesktopApp() {
   const keepAliveFailedRef = useRef(false);
   useEffect(() => {
     if (!IS_ANDROID) return;
-    const open = sessions.filter(s => s.kind !== 'local').length;
+    const open = sessions.filter(s => !s.kind).length;
     if (keepAliveSentRef.current === open) return;
     keepAliveSentRef.current = open;
     invoke("android_keep_alive", { sessions: open }).catch((e) => {
@@ -630,12 +639,13 @@ function DesktopApp() {
       const list = await invoke<any[]>("get_servers");
       const toStart = list.filter((s) => s.autostart);
       if (toStart.length === 0) return;
-      const newSessions = toStart.map((s) => ({
-        id: `session-${s.id}`,
-        serverId: s.id,
-        serverName: s.name,
-        mirrors: s.mirrors,
-      }));
+      const newSessions: Session[] = toStart.map((s) => {
+        const serial = serialFromServer(s);
+        // A serial server opens its port (SerialView), like openServer.
+        return serial
+          ? { id: `session-${s.id}`, serverId: s.id, serverName: s.name, kind: 'serial' as const, serial: { port: serial.port, summary: serialSummary(serial) } }
+          : { id: `session-${s.id}`, serverId: s.id, serverName: s.name, mirrors: s.mirrors };
+      });
       setSessions((prev: any[]) => {
         const seen = new Set(prev.map((p) => p.id));
         const fresh = newSessions.filter((n) => !seen.has(n.id));
@@ -669,7 +679,7 @@ function DesktopApp() {
     if (!sessionCloseNeedsConfirm(terms, sessionStatuses[s.id], appSettings.warnOnCloseActiveSession)) return true;
     const ok = await confirm({
       title: "Close this session?",
-      message: s.kind === 'local' ? "The shell will be closed." : "The SSH connection will be dropped.",
+      message: s.kind === 'local' ? "The shell will be closed." : s.kind === 'serial' ? "The serial port will be closed." : "The SSH connection will be dropped.",
       okLabel: "Close",
       destructive: true,
     });
@@ -869,7 +879,19 @@ function DesktopApp() {
   const openServer = (server: any) => {
     const sessionId = `session-${server.id}`;
     const existing = sessions.find(s => s.id === sessionId);
-    if (!existing) {
+    const serial = serialFromServer(server);
+    if (!existing && serial) {
+      // A serial server opens its port (SerialView); Rust reads the port
+      // and line settings from the vault by id.
+      setSessions([...sessions, {
+        id: sessionId,
+        serverId: server.id,
+        serverName: server.name,
+        kind: 'serial',
+        serial: { port: serial.port, summary: serialSummary(serial) },
+        runOnConnect: server.run_on_connect || "",
+      }]);
+    } else if (!existing) {
       setSessions([...sessions, {
         id: sessionId,
         serverId: server.id,
@@ -909,6 +931,36 @@ function DesktopApp() {
     invoke("save_quick_connect_node", { auth })
       .then(() => { refreshServers(); addLog(`Saved node → ${displayName}`, "success"); })
       .catch((e) => reportError("The quick-connect server was not saved", e));
+  };
+
+  // Quick connect to a serial port: unlike SSH, a port is only ever opened as
+  // a saved server (Rust reads its settings from the vault), so the node is
+  // saved first; one already saved at the root with the same port and
+  // settings is reused, as SSH's Quick connect does for the same target.
+  const openSerialQuickConnect = async (settings: SerialSettings) => {
+    const known = servers.find((sv: any) => !sv.folder_id && isSerialServer(sv)
+      && (() => { const s = serialFromServer(sv); return !!s && sameSerial(s, settings); })());
+    if (known) {
+      setIsQuickConnectOpen(false);
+      openServer(known);
+      return;
+    }
+    const name = `${settings.port} ${serialSummary(settings)}`;
+    const request = {
+      id: null, name, host: "", port: 22, username: null, password: null, preservePassword: false,
+      credentialId: null, folderId: null, proxyType: "none", proxyHost: "", proxyPort: 1080, tunnels: [],
+      authType: "custom_pass", keyId: null, autostart: false, mirrors: [], color: null, notes: "",
+      runOnConnect: "", jumpHostId: null, legacyAlgorithms: false, terminalOnly: false,
+      connectionType: "serial", serial: settings,
+    };
+    const saved = await invoke<{ id: number; persistError: string | null }>("save_server", { request });
+    if (saved.persistError) {
+      reportError("Saved for this session, but the profile file could not be written (the next change tries again)", saved.persistError);
+    }
+    refreshServers();
+    setIsQuickConnectOpen(false);
+    addLog(`Quick connect → ${name}`, "info");
+    openServer({ id: saved.id, name, connection_type: "serial", serial: settings });
   };
 
   // Local (non-SSH) shell tab. Modeled directly on openQuickConnect above —
@@ -973,6 +1025,8 @@ function DesktopApp() {
       jumpHostId: server.jump_host_id?.toString() || "",
       legacyAlgorithms: !!server.legacy_algorithms,
       terminalOnly: !!server.terminal_only,
+      connectionType: isSerialServer(server) ? "serial" : "ssh",
+      serial: serialFromServer(server) ?? defaultSerial(),
       // Starts clean — only flips true if the user types into the password
       // field. Save handler reads this to decide between `preserve_password`
       // and a real overwrite.
@@ -1545,7 +1599,12 @@ function DesktopApp() {
             <button
               className="w-full text-left px-3 py-1.5 hover:bg-white/10 text-zinc-200"
               onClick={() => {
-                invoke("disconnect_session", { sessionId: targetId }).catch(console.error);
+                // A serial tab closes its port and stays (Reconnect opens it again).
+                if (sessions.find(s => s.id === targetId)?.kind === 'serial') {
+                  invoke("close_terminal", { terminalId: `serial-term-${targetId}` }).catch(console.error);
+                } else {
+                  invoke("disconnect_session", { sessionId: targetId }).catch(console.error);
+                }
                 setTabMenu(null);
               }}
             >Disconnect</button>
@@ -2085,6 +2144,13 @@ function DesktopApp() {
                           >
                             {sess.kind === 'local' ? (
                               <LocalShellView
+                                session={sess}
+                                onClose={getCloseHandler(sess.id)}
+                                onStatusChange={handleSessionStatus}
+                                onTerminalsChange={handleTerminalsChange}
+                              />
+                            ) : sess.kind === 'serial' ? (
+                              <SerialView
                                 session={sess}
                                 onClose={getCloseHandler(sess.id)}
                                 onStatusChange={handleSessionStatus}
@@ -2654,6 +2720,40 @@ function DesktopApp() {
           newNode={newNode} setNewNode={setNewNode}
           isEditMode={!!newNode.id}
           onSave={async () => {
+            // A serial server (schema 7): name, folder, colour, notes,
+            // commands run on connect, autostart, and its port; Rust clears
+            // everything that belongs to SSH whatever is sent.
+            if (newNode.connectionType === "serial") {
+              const problem = !newNode.name.trim() ? "Name is required." : serialProblem(newNode.serial);
+              if (problem) {
+                setFormError(problem);
+                addLog(problem, "error");
+                return;
+              }
+              try {
+                const request = {
+                  id: newNode.id, name: newNode.name, host: "", port: 22, username: null, password: null,
+                  preservePassword: false, credentialId: null,
+                  folderId: newNode.folderId ? parseInt(newNode.folderId) : null,
+                  proxyType: "none", proxyHost: "", proxyPort: 1080, tunnels: [], authType: "custom_pass", keyId: null,
+                  autostart: !!newNode.autostart, mirrors: [], color: newNode.color ?? null, notes: newNode.notes || "",
+                  runOnConnect: newNode.runOnConnect || "", jumpHostId: null, legacyAlgorithms: false, terminalOnly: false,
+                  connectionType: "serial",
+                  serial: { ...newNode.serial, port: newNode.serial.port.trim() },
+                };
+                const saved = await invoke<{ id: number; persistError: string | null }>("save_server", { request });
+                closeNodePanel();
+                refreshServers();
+                if (saved.persistError) {
+                  reportError("Saved for this session, but the profile file could not be written (the next change tries again)", saved.persistError);
+                }
+                addLog(`Node ${newNode.id ? 'updated' : 'added'} successfully.`, "success");
+              } catch (e) {
+                setFormError(`Failed to save: ${e}`);
+                addLog(`SAVE_ERROR: ${e}`, "error");
+              }
+              return;
+            }
             if (!newNode.name || !newNode.host) {
               setFormError("Name and Host are required.");
               addLog("Name and Host are required.", "error");
@@ -2741,6 +2841,7 @@ function DesktopApp() {
                 jumpHostId: newNode.jumpHostId ? parseInt(newNode.jumpHostId) : null,
                 legacyAlgorithms: !!newNode.legacyAlgorithms,
                 terminalOnly: !!newNode.terminalOnly,
+                connectionType: "ssh",
               };
               const saved = await invoke<{ id: number; persistError: string | null }>("save_server", { request });
               const savedId = saved.id;
@@ -2778,6 +2879,7 @@ function DesktopApp() {
           isOpen
           onClose={() => setIsQuickConnectOpen(false)}
           onConnect={openQuickConnect}
+          onSerialConnect={openSerialQuickConnect}
         />
       )}
 

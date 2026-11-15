@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import Sparkline from "./Sparkline";
 import { useConfirm } from "../ui/confirm";
+import { isSerialServer } from "../util/serialSettings";
 
 // ---------- shared types ------------------------------------------------------
 
@@ -399,7 +400,8 @@ const MonitoringPanel = ({ servers, addLog }: Props) => {
   // ---- derived ----------------------------------------------------------------
 
   const availableToAdd = useMemo(
-    () => servers.filter((s: any) => !rows.some((r) => r.node_id === s.id)),
+    // A serial port has no SSH connection to watch (Rust refuses it too).
+    () => servers.filter((s: any) => !isSerialServer(s) && !rows.some((r) => r.node_id === s.id)),
     [servers, rows]
   );
   const anyRunning = rows.some((r) => !r.paused && !r.auth_failed);

@@ -1,4 +1,5 @@
-import { Search, Plus, Server, Globe, Folder, FolderPlus, ChevronLeft, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, Pin, PinOff, TerminalSquare } from "lucide-react";
+import { Search, Plus, Server, Globe, Folder, FolderPlus, ChevronLeft, Trash2, Edit2, Zap, Check, X, Copy, GripVertical, Pin, PinOff, TerminalSquare, Cable } from "lucide-react";
+import { serialCardLabel, serialFromServer } from "../util/serialSettings";
 import { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useConfirm } from "../ui/confirm";
@@ -52,7 +53,8 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
 
   const filteredServers = servers?.filter((s: any) =>
     s.name.toLowerCase().includes(search.toLowerCase()) ||
-    s.host.includes(search)
+    (s.host || "").includes(search) ||
+    (serialFromServer(s)?.port || "").toLowerCase().includes(search.toLowerCase())
   ) || [];
 
   const currentFolder = folders?.find((f: any) => f.id === activeFolderId);
@@ -313,8 +315,17 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
         <div className="min-w-0 flex-1">
           <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{s.name}</h3>
           <div className="flex items-center gap-1 mt-0.5">
-            <Globe size={10} className="text-zinc-400 shrink-0" />
-            <span className="text-[10.5px] text-zinc-300 font-mono truncate">{s.host}</span>
+            {serialCardLabel(s) !== null ? (
+              <>
+                <Cable size={10} className="text-zinc-400 shrink-0" />
+                <span className="text-[10.5px] text-zinc-300 font-mono truncate">{serialCardLabel(s)}</span>
+              </>
+            ) : (
+              <>
+                <Globe size={10} className="text-zinc-400 shrink-0" />
+                <span className="text-[10.5px] text-zinc-300 font-mono truncate">{s.host}</span>
+              </>
+            )}
           </div>
         </div>
 
@@ -651,7 +662,7 @@ export const NodeGrid = ({ servers, folders, activeFolderId: activeFolderIdProp,
               <h3 className="font-bold text-zinc-100 text-[13px] truncate tracking-tight leading-tight">{draggedServer.name}</h3>
               <div className="flex items-center gap-1 mt-0.5">
                 <Globe size={10} className="text-zinc-400 shrink-0" />
-                <span className="text-[10.5px] text-zinc-300 font-mono truncate">{draggedServer.host}</span>
+                <span className="text-[10.5px] text-zinc-300 font-mono truncate">{serialCardLabel(draggedServer) ?? draggedServer.host}</span>
               </div>
             </div>
           </div>

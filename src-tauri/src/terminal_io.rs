@@ -184,6 +184,11 @@ pub(crate) trait TerminalIo: Send {
     /// closed the channel, the program exited), rather than the connection
     /// going away under it.
     fn ended_by_peer(&self) -> bool;
+    /// Send break, in order with the keys before it. Only a serial port can.
+    fn send_break(&mut self, reply: tokio::sync::oneshot::Sender<Result<(), String>>) -> impl Future<Output = ()> + Send {
+        let _ = reply.send(Err("[SERIAL] NOT_SERIAL: only a serial port can send a break.".into()));
+        async {}
+    }
 }
 
 /// Why a terminal ended.
@@ -365,6 +370,7 @@ pub(crate) async fn pump<I: TerminalIo>(
                     out.ack(bytes);
                     out.send(&mut emit);
                 }
+                Some(TerminalCommand::Break(reply)) => io.send_break(reply).await,
                 None => {
                     io.end().await;
                     out.send_all(&mut emit);

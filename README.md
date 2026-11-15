@@ -27,7 +27,7 @@ Solanum is a free, open-source SSH and SFTP client. Each server gets one tabbed 
 - **One window per server**: terminal, SFTP, tunnels, folder mirror, Docker and live server info as tabs of the same session
 - **Many servers at once**: split view for two sessions side by side, a **Wall** that shows terminals from several servers in a grid, and **broadcast input** to type into several sessions at once
 - **Local shells** next to your SSH sessions: PowerShell, Command Prompt, WSL or Git Bash on Windows, your own shell on Linux and macOS
-- **Network gear welcome**: Cisco switches and other devices that allow one channel per connection get a clean terminal session, and old SHA-1 algorithms can be allowed for the servers that need them
+- **Network gear welcome**: Cisco switches and other devices that allow one channel per connection get a clean terminal session, old SHA-1 algorithms can be allowed for the servers that need them, and serial consoles open in a tab
 - **Encrypted vault**: your profiles are sealed with Argon2id and AES-256-GCM, on your device only
 - **Host import** from an OpenSSH config, PuTTY or MobaXterm: Add server → **Import hosts**
 - **Native and light**: Rust and Tauri, no bundled Chromium
@@ -49,6 +49,7 @@ More screenshots are in [docs/screenshots](docs/screenshots).
 - Key, password, keyboard-interactive and **two-step logins** (a key, then a password or a code)
 - **Run on connect**: commands typed into the first terminal when the server connects
 - **Autostart** servers when Solanum opens, and **Quick connect**: type an address and go (the server is added to your list for next time)
+- **Serial consoles** (desktop): a COM port or `/dev/tty*` device as a server or in Quick connect, with speed, data bits, parity, stop bits and flow control as in PuTTY, and **Send break**
 - **Import hosts** (Add server → Import hosts) from an OpenSSH config, PuTTY (`.reg`), MobaXterm (`.mxtsessions`) or a JSON list: each host's name, address, port and user, never a password or key
 - **Terminal only**, for devices that allow one channel per connection: Solanum recognises Cisco devices by itself and offers to remember any other, so SFTP, Info and Docker step aside instead of failing
 - **Local shell tabs** (desktop): your login shell or another from your system's list, PowerShell, PowerShell 7, Command Prompt, WSL or Git Bash on Windows. Each one asks first, in a system dialog

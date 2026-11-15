@@ -43,6 +43,8 @@ mod terminal_io;
 // Android has no local shell, so most of it is unused there.
 #[cfg_attr(target_os = "android", allow(dead_code))]
 mod local_shell;
+// Serial consoles: desktop only (Android has no serial ports an app may open).
+mod serial;
 mod local_path;
 // Android opens no files and starts no local shell, so most of it is unused there.
 #[cfg_attr(target_os = "android", allow(dead_code))]
@@ -673,18 +675,31 @@ fn sweep_stale_temp_files(vault_path: &std::path::Path) {
 /// This app is standalone: it opens only vaults it created itself, at exactly this
 /// version. Anything else — a file from the original Submarine app, or a vault
 /// written by a newer build of this app — is refused rather than half-understood.
-/// When the schema changes, bump this AND add a migration from the previous
-/// version in `load_vault` — unless, as with the 1->2 bump (added `pinned_at`
-/// to `servers`/`folders`), the 2->3 bump (added the `snippets` table), the
-/// 3->4 bump (foreign keys on every reference, shipped together with vault file
-/// format 2), the 4->5 bump (per-server `legacy_algorithms`) and the 5->6 bump
-/// (per-server `terminal_only`), there's no real vault yet worth preserving
-/// across the change;
-/// pre-release, a clean break (old vaults refused like any other incompatible
-/// file, just recreate them) is simpler than migration machinery nobody needs
-/// yet. Once real vaults exist, go back to migrating. A pre-release bump also
-/// means regenerating the fixture vault (see `fixture_vault_tests`).
-const SCHEMA_VERSION: i64 = 6;
+/// The vault schema this build writes. Since 1.0.0 real profiles exist, so a
+/// change bumps this, updates `create_vault_schema` for new vaults, AND adds a
+/// step to `migrate_vault` that upgrades the previous version (plus a new
+/// fixture: see `fixture_vault_tests`). History: 1 to 6 before 1.0.0, with no
+/// migrations (`pinned_at`; `snippets`; foreign keys with vault format 2;
+/// `legacy_algorithms`; `terminal_only`), and vaults of those schemas are
+/// still refused (`SCHEMA_BEHIND_BINARY`); 6 shipped with 1.0.0 and 1.0.1;
+/// 7 adds serial servers (`connection_type` and the `serial_*` columns,
+/// 1.0.2), upgraded from 6 by `SCHEMA_6_TO_7`.
+const SCHEMA_VERSION: i64 = 7;
+
+/// The oldest schema `migrate_vault` upgrades: the one 1.0.0 shipped.
+const FIRST_MIGRATED_SCHEMA: i64 = 6;
+
+/// Schema 6 to 7: serial servers. Defaults make every existing server an SSH
+/// one with PuTTY's serial defaults, exactly what a new vault holds. No CHECK
+/// constraints: SQLite cannot relax one without rebuilding the table, and
+/// `save_server` validates every value (`serial::SerialSettings`).
+const SCHEMA_6_TO_7: &str = "ALTER TABLE servers ADD COLUMN connection_type TEXT NOT NULL DEFAULT 'ssh';
+     ALTER TABLE servers ADD COLUMN serial_port TEXT NOT NULL DEFAULT '';
+     ALTER TABLE servers ADD COLUMN serial_baud INTEGER NOT NULL DEFAULT 9600;
+     ALTER TABLE servers ADD COLUMN serial_data_bits INTEGER NOT NULL DEFAULT 8;
+     ALTER TABLE servers ADD COLUMN serial_parity TEXT NOT NULL DEFAULT 'none';
+     ALTER TABLE servers ADD COLUMN serial_stop_bits INTEGER NOT NULL DEFAULT 1;
+     ALTER TABLE servers ADD COLUMN serial_flow TEXT NOT NULL DEFAULT 'none';";
 
 /// The in-memory database that holds a decrypted vault. EVERY vault connection
 /// must come from here.
@@ -724,6 +739,9 @@ fn open_vault_memory_db() -> Result<Connection, String> {
 /// exchange, MACs and `ssh-rsa` signatures (`ssh_connect::AlgorithmPolicy`).
 /// `servers.terminal_only` (schema 6) makes a connection to that server a plain
 /// terminal, with no SFTP, live info or Docker (`ssh_connect::ChannelGate`).
+/// `servers.connection_type` (schema 7) is `ssh` or `serial`; a serial server
+/// keeps its port and line settings in the `serial_*` columns (`serial.rs`),
+/// in the same order and with the same defaults as `SCHEMA_6_TO_7` adds them.
 ///
 /// References and what deleting the referenced row does (schema 4 and 5):
 /// - `folders.parent_id`, `servers.folder_id`: CASCADE — a folder takes its
@@ -747,7 +765,7 @@ fn create_vault_schema(conn: &Connection) -> Result<(), String> {
         "CREATE TABLE folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER REFERENCES folders(id) ON DELETE CASCADE, color TEXT, pinned_at INTEGER);
          CREATE TABLE ssh_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT);
          CREATE TABLE credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER REFERENCES ssh_keys(id) ON DELETE SET NULL);
-         CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER REFERENCES credentials(id) ON DELETE SET NULL, folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER REFERENCES ssh_keys(id) ON DELETE SET NULL, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT NOT NULL DEFAULT '[]', color TEXT, notes TEXT NOT NULL DEFAULT '', run_on_connect TEXT NOT NULL DEFAULT '', jump_host_id INTEGER REFERENCES servers(id) ON DELETE NO ACTION, position INTEGER NOT NULL DEFAULT 0, pinned_at INTEGER, legacy_algorithms INTEGER NOT NULL DEFAULT 0, terminal_only INTEGER NOT NULL DEFAULT 0);
+         CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER REFERENCES credentials(id) ON DELETE SET NULL, folder_id INTEGER REFERENCES folders(id) ON DELETE CASCADE, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER REFERENCES ssh_keys(id) ON DELETE SET NULL, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT NOT NULL DEFAULT '[]', color TEXT, notes TEXT NOT NULL DEFAULT '', run_on_connect TEXT NOT NULL DEFAULT '', jump_host_id INTEGER REFERENCES servers(id) ON DELETE NO ACTION, position INTEGER NOT NULL DEFAULT 0, pinned_at INTEGER, legacy_algorithms INTEGER NOT NULL DEFAULT 0, terminal_only INTEGER NOT NULL DEFAULT 0, connection_type TEXT NOT NULL DEFAULT 'ssh', serial_port TEXT NOT NULL DEFAULT '', serial_baud INTEGER NOT NULL DEFAULT 9600, serial_data_bits INTEGER NOT NULL DEFAULT 8, serial_parity TEXT NOT NULL DEFAULT 'none', serial_stop_bits INTEGER NOT NULL DEFAULT 1, serial_flow TEXT NOT NULL DEFAULT 'none');
          CREATE TABLE commands (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT);
          CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT);
          CREATE TABLE snippets (id INTEGER PRIMARY KEY AUTOINCREMENT, trigger_text TEXT NOT NULL UNIQUE, expansion_text TEXT NOT NULL);
@@ -766,17 +784,53 @@ fn create_vault_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("[DATABASE] SCHEMA_CREATION_FAILED: {}", e))
 }
 
-/// Accept a vault only if it carries exactly this app's schema version. Nothing
-/// is ever rewritten here: a refused vault is left exactly as it was.
+/// The schema version a vault says it has. A database with no `schema_meta`
+/// (a foreign file) reads as version 0.
+fn stored_schema_version(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Upgrades a vault of an older schema to `SCHEMA_VERSION`, one step at a
+/// time, in one transaction, on the in-memory connection only: the profile
+/// file is rewritten at its next save, and the `.bak` written at this unlock
+/// keeps the file as it was. Runs between `deserialize` and
+/// `check_vault_schema`. Vaults older than `FIRST_MIGRATED_SCHEMA` (before
+/// 1.0.0), newer ones and foreign files are left alone for
+/// `check_vault_schema` to refuse. Its errors never contain the word "decrypt".
+fn migrate_vault(conn: &Connection) -> Result<(), String> {
+    let stored = stored_schema_version(conn);
+    if !(FIRST_MIGRATED_SCHEMA..SCHEMA_VERSION).contains(&stored) {
+        return Ok(());
+    }
+    let failed = |from: i64, e: rusqlite::Error| {
+        format!("[DATABASE] MIGRATION_FAILED: this profile could not be upgraded from schema v{from}: {e}. The profile file is left untouched.")
+    };
+    let tx = conn.unchecked_transaction().map_err(|e| failed(stored, e))?;
+    for from in stored..SCHEMA_VERSION {
+        let step = match from {
+            6 => SCHEMA_6_TO_7,
+            _ => return Err(format!("[DATABASE] MIGRATION_FAILED: no upgrade from schema v{from}.")),
+        };
+        tx.execute_batch(step).map_err(|e| failed(from, e))?;
+    }
+    tx.execute(
+        "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+        [SCHEMA_VERSION.to_string()],
+    )
+    .map_err(|e| failed(stored, e))?;
+    tx.commit().map_err(|e| failed(stored, e))
+}
+
+/// Accept a vault only if it carries exactly this app's schema version
+/// (`migrate_vault` has upgraded the ones it can). Nothing is ever rewritten
+/// here: a refused vault is left exactly as it was.
 fn check_vault_schema(conn: &Connection) -> Result<(), String> {
-    // A database with no `schema_meta` (a foreign file) reads as version 0.
-    let stored: i64 = conn
-        .query_row(
-            "SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let stored = stored_schema_version(conn);
     if stored > SCHEMA_VERSION {
         return Err(format!(
             "[DATABASE] SCHEMA_AHEAD_OF_BINARY: this profile was written by a newer build (schema v{}), this app understands v{}. Upgrade the app before opening it.",
@@ -785,10 +839,10 @@ fn check_vault_schema(conn: &Connection) -> Result<(), String> {
     }
     if stored < SCHEMA_VERSION {
         // stored == 0 means no schema_meta row at all — genuinely not one of
-        // ours. stored > 0 means this really was a Solanum vault, just at an
-        // older internal schema this pre-release build no longer reads (no
-        // migration path yet, see SCHEMA_VERSION's doc comment) — that's a
-        // different, more honest thing to tell the user than "foreign file".
+        // ours. stored > 0 means this really was a Solanum vault, at a schema
+        // from before 1.0.0 that is not migrated (see SCHEMA_VERSION's doc
+        // comment) — that's a different, more honest thing to tell the user
+        // than "foreign file".
         if stored == 0 {
             return Err(format!("[VAULT] UNSUPPORTED_PROFILE: {}", FOREIGN_PROFILE_MSG));
         }
@@ -813,6 +867,7 @@ fn load_vault(encrypted_data: &[u8], key: &[u8; 32]) -> Result<Connection, Strin
         .map_err(|e| format!("[DATABASE] DESERIALIZE_FAILED: {}", e))?;
     conn.execute_batch(SECURE_DELETE_PRAGMA)
         .map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
+    migrate_vault(&conn)?;
     check_vault_schema(&conn)?;
     check_vault_integrity(&conn)?;
     Ok(conn)
@@ -998,6 +1053,288 @@ mod vault_schema_tests {
         newer.execute("UPDATE schema_meta SET value=?1 WHERE key='schema_version'", [(SCHEMA_VERSION + 1).to_string()]).unwrap();
         let err = load_vault(&seal(&mut newer, &key, &[5u8; SALT_LEN]), &key).unwrap_err();
         assert!(err.contains("SCHEMA_AHEAD_OF_BINARY"), "{err}");
+    }
+
+    /// A vault as 1.0.0 and 1.0.1 wrote it (schema 6): a new vault without
+    /// the columns schema 7 added, with a server and a login in it.
+    fn schema6_vault_conn() -> Connection {
+        let conn = fresh_vault_conn();
+        conn.execute_batch(
+            "ALTER TABLE servers DROP COLUMN serial_flow;
+             ALTER TABLE servers DROP COLUMN serial_stop_bits;
+             ALTER TABLE servers DROP COLUMN serial_parity;
+             ALTER TABLE servers DROP COLUMN serial_data_bits;
+             ALTER TABLE servers DROP COLUMN serial_baud;
+             ALTER TABLE servers DROP COLUMN serial_port;
+             ALTER TABLE servers DROP COLUMN connection_type;
+             UPDATE schema_meta SET value='6' WHERE key='schema_version';",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// What a vault's tables are, column by column (name, type, NOT NULL,
+    /// default, primary key), plus its indexes: an upgraded vault must be
+    /// indistinguishable from a new one.
+    fn shape(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut objects = conn.prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").unwrap();
+        let objects: Vec<(String, String)> = objects.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect();
+        for (kind, name) in objects {
+            out.push(format!("{kind} {name}"));
+            if kind == "table" {
+                let mut cols = conn.prepare("SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_xinfo(?1) ORDER BY cid").unwrap();
+                let cols = cols
+                    .query_map([&name], |r| {
+                        Ok(format!("  {} {} {} {:?} {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?, r.get::<_, i64>(4)?))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap);
+                out.extend(cols);
+                let mut fks = conn.prepare("SELECT \"from\", \"table\", \"to\", on_delete FROM pragma_foreign_key_list(?1) ORDER BY id, seq").unwrap();
+                let fks = fks
+                    .query_map([&name], |r| Ok(format!("  fk {} -> {}.{:?} {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?)))
+                    .unwrap()
+                    .map(Result::unwrap);
+                out.extend(fks);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_schema6_vault_is_upgraded_with_its_content_intact() {
+        let key = [0x61u8; 32];
+        let mut old = schema6_vault_conn();
+        assert_eq!(stored_version(&old), 6);
+        let loaded = load_vault(&seal(&mut old, &key, &[6u8; SALT_LEN]), &key).unwrap();
+        assert_eq!(stored_version(&loaded), SCHEMA_VERSION);
+        assert_eq!(count(&loaded, "SELECT COUNT(*) FROM servers WHERE name='bastion' AND password='bastion-pw' AND folder_id=1"), 1);
+        assert_eq!(count(&loaded, "SELECT COUNT(*) FROM credentials WHERE password='cred-secret-pw'"), 1);
+        // Every existing server is an SSH one, with PuTTY's serial defaults.
+        let row: (String, String, i64, i64, String, i64, String) = loaded
+            .query_row(
+                "SELECT connection_type, serial_port, serial_baud, serial_data_bits, serial_parity, serial_stop_bits, serial_flow FROM servers WHERE name='bastion'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("ssh".into(), String::new(), 9600, 8, "none".into(), 1, "none".into()));
+        assert_eq!(count(&loaded, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    }
+
+    /// The step must leave a vault exactly as `create_vault_schema` makes a
+    /// new one: same tables, columns in the same order with the same types,
+    /// NOT NULL, defaults and keys, same references and indexes.
+    #[test]
+    fn an_upgraded_vault_has_exactly_the_shape_of_a_new_one() {
+        let upgraded = schema6_vault_conn();
+        migrate_vault(&upgraded).unwrap();
+        assert_eq!(shape(&upgraded), shape(&fresh_vault_conn()));
+        assert_eq!(stored_version(&upgraded), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn the_current_schema_and_others_are_not_touched_by_the_upgrade() {
+        let current = fresh_vault_conn();
+        let before = shape(&current);
+        migrate_vault(&current).unwrap();
+        assert_eq!(shape(&current), before);
+        for version in [1, 5, SCHEMA_VERSION + 1, 99] {
+            let conn = fresh_vault_conn();
+            conn.execute("UPDATE schema_meta SET value=?1 WHERE key='schema_version'", [version.to_string()]).unwrap();
+            migrate_vault(&conn).unwrap();
+            assert_eq!(stored_version(&conn), version, "v{version} left for check_vault_schema to refuse");
+        }
+    }
+
+    /// Profiles from before 1.0.0 are still refused through the real path,
+    /// with the message that says to recreate them; nothing is upgraded.
+    #[test]
+    fn vaults_from_before_1_0_are_still_refused_by_load_vault() {
+        let key = [0x62u8; 32];
+        for older in 1..FIRST_MIGRATED_SCHEMA {
+            let mut conn = schema6_vault_conn();
+            conn.execute("UPDATE schema_meta SET value=?1 WHERE key='schema_version'", [older.to_string()]).unwrap();
+            let err = load_vault(&seal(&mut conn, &key, &[older as u8; SALT_LEN]), &key).unwrap_err();
+            assert!(err.contains("SCHEMA_BEHIND_BINARY"), "v{older}: {err}");
+            assert!(!err.to_lowercase().contains("decrypt"), "{err}");
+        }
+    }
+
+    /// An upgrade that fails refuses the profile, says so without the word
+    /// "decrypt" (the picker would call it a wrong password), and applies
+    /// nothing: the transaction is rolled back.
+    #[test]
+    fn a_failed_upgrade_refuses_the_vault_and_applies_nothing() {
+        // Claims schema 6 but already has the first new column.
+        let conn = schema6_vault_conn();
+        conn.execute_batch("ALTER TABLE servers ADD COLUMN connection_type TEXT NOT NULL DEFAULT 'ssh';").unwrap();
+        let err = migrate_vault(&conn).unwrap_err();
+        assert!(err.contains("MIGRATION_FAILED"), "{err}");
+        assert!(!err.to_lowercase().contains("decrypt"), "{err}");
+        assert_eq!(stored_version(&conn), 6, "rolled back");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pragma_table_info('servers') WHERE name='serial_port'"), 0, "rolled back");
+
+        let key = [0x63u8; 32];
+        let mut sealed = schema6_vault_conn();
+        sealed.execute_batch("ALTER TABLE servers ADD COLUMN serial_port TEXT;").unwrap();
+        let err = load_vault(&seal(&mut sealed, &key, &[9u8; SALT_LEN]), &key).unwrap_err();
+        assert!(err.contains("MIGRATION_FAILED") && !err.to_lowercase().contains("decrypt"), "{err}");
+    }
+
+    /// The string literals of a Rust source file, escapes resolved (enough of
+    /// Rust's syntax for this crate: comments, char literals and lifetimes,
+    /// raw strings, line continuations).
+    fn string_literals(src: &str) -> Vec<String> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                // A char literal ('"', '\'', 'x'); a lifetime ('a) is skipped as one character.
+                b'\'' => {
+                    if b.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        while i < b.len() && b[i] != b'\'' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else if b.get(i + 2) == Some(&b'\'') {
+                        i += 3;
+                    } else {
+                        i += 1;
+                    }
+                }
+                b'r' if (b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#'))
+                    && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+                {
+                    let mut hashes = 0;
+                    let mut j = i + 1;
+                    while b.get(j) == Some(&b'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if b.get(j) != Some(&b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let start = j + 1;
+                    let end = src[start..].find(&close).map(|e| start + e).unwrap_or(b.len());
+                    out.push(src[start..end].to_string());
+                    i = end + close.len();
+                }
+                b'"' => {
+                    let mut s = String::new();
+                    let mut chars = src[i + 1..].char_indices();
+                    let mut consumed = src.len() - i - 1;
+                    while let Some((k, c)) = chars.next() {
+                        match c {
+                            '"' => {
+                                consumed = k + 1;
+                                break;
+                            }
+                            '\\' => match chars.next() {
+                                Some((_, 'n')) => s.push('\n'),
+                                Some((_, 't')) => s.push('\t'),
+                                Some((_, 'r')) => s.push('\r'),
+                                Some((_, '0')) => s.push('\0'),
+                                Some((_, '\n')) => {
+                                    // A line continuation: the newline and the next line's indentation go.
+                                    while chars.clone().next().is_some_and(|(_, w)| w.is_whitespace()) {
+                                        chars.next();
+                                    }
+                                }
+                                Some((_, 'u')) => {
+                                    let mut hex = String::new();
+                                    for (_, h) in chars.by_ref() {
+                                        if h == '}' {
+                                            break;
+                                        }
+                                        if h != '{' {
+                                            hex.push(h);
+                                        }
+                                    }
+                                    if let Some(c) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                                        s.push(c);
+                                    }
+                                }
+                                Some((_, other)) => s.push(other),
+                                None => break,
+                            },
+                            other => s.push(other),
+                        }
+                    }
+                    out.push(s);
+                    i += 1 + consumed;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_literal_reader_reads_what_this_crate_writes() {
+        let src = "let a = \"SELECT 1\"; // \"not this\"\n let c = '\"'; let l: &'a str = \"two \\\n            lines\"; /* \"nor this\" */ let r = r#\"raw \"x\"\"#; let e = \"q\\\"d\\n\";";
+        assert_eq!(string_literals(src), vec!["SELECT 1", "two lines", "raw \"x\"", "q\"d\n"]);
+    }
+
+    /// CLAUDE.md: after a schema change every SQL literal must still prepare.
+    /// Every statement in the crate's source (tests included) is prepared
+    /// against a new vault and against a schema 6 vault after the upgrade.
+    /// Templates (`format!` with `{...}`) are left out; the few statements
+    /// meant for something else (a foreign database, the schema 6 shape
+    /// itself) are named below.
+    #[test]
+    fn every_sql_literal_prepares_against_new_and_upgraded_vaults() {
+        const NOT_FOR_A_VAULT: &[&str] = &[];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut statements = Vec::new();
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = fs::read_to_string(&path).unwrap();
+            for lit in string_literals(&src) {
+                // This crate writes SQL keywords in capitals; "Select a file" is a dialog title.
+                let head = lit.trim();
+                let is_dml = ["SELECT ", "INSERT ", "UPDATE ", "DELETE ", "WITH "].iter().any(|k| head.starts_with(k));
+                if !is_dml || lit.contains('{') || NOT_FOR_A_VAULT.iter().any(|n| lit.contains(n)) {
+                    continue;
+                }
+                statements.push((path.file_name().unwrap().to_string_lossy().to_string(), lit));
+            }
+        }
+        assert!(statements.len() > 100, "the reader found only {} statements", statements.len());
+        let upgraded = schema6_vault_conn();
+        migrate_vault(&upgraded).unwrap();
+        let mut failures = Vec::new();
+        for conn in [fresh_vault_conn(), upgraded] {
+            for (file, sql) in &statements {
+                for part in sql.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+                    if let Err(e) = conn.prepare(part) {
+                        failures.push(format!("{file}: {e}\n    {part}"));
+                    }
+                }
+            }
+        }
+        failures.dedup();
+        assert!(failures.is_empty(), "{} statements do not prepare:\n{}", failures.len(), failures.join("\n"));
     }
 
     #[test]
@@ -1868,6 +2205,60 @@ mod teardown_tests {
         stopped
     }
 
+    /// A lock closes an open serial port (the next profile, or the next
+    /// start, may open it again), and a port opened while a lock runs is
+    /// closed again instead of being registered.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn locking_closes_an_open_serial_port() {
+        use std::io::Read;
+        let dir = scratch_dir();
+        let db = DbState::default();
+        open_profile_into_state(&db, dir.join("p.solanum"), PW.into(), OpenMode::CreateOnly).await.unwrap();
+        let ssh = SshState::new();
+        let monitors: MonitorMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let mirrors: MirrorMap = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let settings: SharedSettings = Arc::new(tokio::sync::Mutex::new(monitor::MonitorSettings::default()));
+        let pair = || {
+            let (mut device, mut ours) = serialport::TTYPort::pair().unwrap();
+            serialport::SerialPort::set_timeout(&mut device, std::time::Duration::from_millis(50)).unwrap();
+            serialport::SerialPort::set_timeout(&mut ours, serial::IO_TIMEOUT).unwrap();
+            (device, serial::SerialTerminal::start(Box::new(ours), serial::Flow::None))
+        };
+        let closed = |device: &mut serialport::TTYPort| {
+            let mut buf = [0u8; 8];
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < until {
+                match device.read(&mut buf) {
+                    Err(e) if e.kind() != std::io::ErrorKind::TimedOut => return true,
+                    _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
+            false
+        };
+
+        let (mut device, io) = pair();
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+        serial::run_terminal(&ssh, &ssh.epoch(), "serial-term-session-9".into(), io, None, |_: &[u8]| {}, move |ended, _| {
+            let _ = ended_tx.send(ended);
+        })
+        .await
+        .unwrap();
+        let before = ssh.epoch();
+        let _ = teardown_profile(&db, &ssh, &monitors, &mirrors, &settings, live_edit::StopReason::ProfileClosed).await;
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), ended_rx).await.expect("the terminal ends").unwrap();
+        assert_eq!(ended, terminal_io::Ended::Closed);
+        assert!(tokio::task::spawn_blocking(move || closed(&mut device)).await.unwrap(), "the port is still open after the lock");
+
+        // Opened before the lock began, registered after it: refused, and closed.
+        let (mut device, io) = pair();
+        let err = serial::run_terminal(&ssh, &before, "serial-term-session-9".into(), io, None, |_: &[u8]| {}, |_, _| {}).await.unwrap_err();
+        assert!(err.contains("PROFILE_CLOSING"), "{err}");
+        assert!(ssh.terminal_txs.lock().await.is_empty());
+        assert!(tokio::task::spawn_blocking(move || closed(&mut device)).await.unwrap(), "a late port is closed again");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn locking_stops_everything_the_profile_has_running() {
         let dir = scratch_dir();
@@ -2175,17 +2566,48 @@ mod import_pick_tests {
 /// the schema. Fake password, synthetic content (TEST-NET addresses, no real
 /// key material), KDF settings at the lower bounds so the test stays fast.
 ///
-/// When `SCHEMA_VERSION` or the file format changes BEFORE the first release,
-/// regenerate it: `SOLANUM_REGENERATE_FIXTURE=1 cargo test --lib -- --ignored regenerate_fixture_vault`
-/// (the variable keeps a plain `cargo test -- --ignored` from rewriting it).
-/// After real user vaults exist, keep this file as it is, add a fixture for the
-/// new version, and make the old one open through the migration instead.
+/// One file per schema since 1.0.0, never rewritten: each must keep opening,
+/// through `migrate_vault`, and come out at the current schema. When
+/// `SCHEMA_VERSION` or the file format changes, add the new version's file:
+/// `SOLANUM_REGENERATE_FIXTURE=1 cargo test --lib -- --ignored regenerate_fixture_vault`
+/// writes `testdata/vault-v<format>-schema<SCHEMA_VERSION>.solanum` and refuses
+/// to overwrite one that exists (the variable keeps a plain
+/// `cargo test -- --ignored` from writing anything). Then add a test for it
+/// here, as for schema 7.
 #[cfg(test)]
 mod fixture_vault_tests {
     use super::*;
 
+    /// Schema 6, as 1.0.0 and 1.0.1 wrote it.
     const FIXTURE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vault-v2-schema6.solanum");
+    /// Schema 7: serial servers (1.0.2).
+    const FIXTURE_V7_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vault-v2-schema7.solanum");
     const FIXTURE_PASSWORD: &str = "solanum-fixture-password";
+
+    /// Opens a committed fixture through the real unlock path, on a copy (it
+    /// writes a lock file and a backup), and checks what opening must not do:
+    /// the file itself is not rewritten, and the backup is the file as it was.
+    fn open_committed_fixture(path: &str) -> (Connection, OpenVault) {
+        let bytes = fs::read(path).unwrap_or_else(|_| panic!("{path} is missing"));
+        let header = parse_vault_header(&bytes).unwrap();
+        assert_eq!(bytes[4], VAULT_VERSION, "fixture file format");
+        assert_eq!((header.kdf.m_cost, header.kdf.t_cost, header.kdf.p_cost), (ARGON2_M_COST_MIN, 1, 1));
+        let dir = std::env::temp_dir().join(format!("solanum-fixture-test-{:016x}", rand::thread_rng().gen::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("fixture.solanum");
+        fs::write(&copy, &bytes).unwrap();
+        let opened = match open_profile_vault(&copy, FIXTURE_PASSWORD, OpenMode::OpenOnly) {
+            Ok(v) => v,
+            Err(e) => panic!(
+                "the committed fixture vault {path} no longer opens: {e}\n\
+                 A schema or format change needs a migration (see SCHEMA_VERSION), never a new fixture in its place."
+            ),
+        };
+        assert_eq!(fs::read(sidecar_path(&copy, "bak")).unwrap(), bytes, "backup written on unlock");
+        assert_eq!(fs::read(&copy).unwrap(), bytes, "opening (and upgrading) does not rewrite the profile file");
+        let _ = fs::remove_dir_all(dir);
+        opened
+    }
 
     fn fixture_content(conn: &Connection) {
         conn.execute_batch(
@@ -2204,15 +2626,27 @@ mod fixture_vault_tests {
              INSERT INTO cmd_history(server_id,server_name,command,ts) VALUES (3,'fixture-lab','ls -la',1759600000000);",
         )
         .unwrap();
+        // Schema 7: a serial server (and, from here on, whatever later schemas add).
+        conn.execute_batch(
+            "INSERT INTO servers(id,name,host,port,auth_type,position,connection_type,serial_port,serial_baud,serial_data_bits,serial_parity,serial_stop_bits,serial_flow,run_on_connect) \
+             VALUES (4,'fixture-console','',0,'vault',1,'serial','COM3',115200,7,'even',2,'rtscts','show version');",
+        )
+        .unwrap();
     }
 
     #[test]
-    #[ignore = "writes testdata/vault-v2-schema6.solanum; run only when the format or schema changes pre-release"]
+    #[ignore = "writes testdata/vault-v<format>-schema<SCHEMA_VERSION>.solanum; run only when the format or schema changes"]
     fn regenerate_fixture_vault() {
         if std::env::var_os("SOLANUM_REGENERATE_FIXTURE").is_none() {
-            eprintln!("regenerate_fixture_vault: set SOLANUM_REGENERATE_FIXTURE=1 to rewrite the committed fixture");
+            eprintln!("regenerate_fixture_vault: set SOLANUM_REGENERATE_FIXTURE=1 to write the fixture of this schema");
             return;
         }
+        let path = std::path::PathBuf::from(format!(
+            "{}/testdata/vault-v{}-schema{}.solanum",
+            env!("CARGO_MANIFEST_DIR"),
+            VAULT_VERSION,
+            SCHEMA_VERSION
+        ));
         let kdf = KdfParams::for_new_vault();
         let kdf = KdfParams { m_cost: ARGON2_M_COST_MIN, t_cost: 1, p_cost: 1, ..kdf };
         let key = derive_key(FIXTURE_PASSWORD, &kdf).unwrap();
@@ -2221,31 +2655,23 @@ mod fixture_vault_tests {
         fixture_content(&conn);
         let bytes = conn.serialize(MAIN_DB).unwrap().to_vec();
         let blob = seal_vault_blob(&vault_compress(&bytes).unwrap(), &key, &kdf).unwrap();
-        fs::create_dir_all(std::path::Path::new(FIXTURE_PATH).parent().unwrap()).unwrap();
-        fs::write(FIXTURE_PATH, blob).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Never in place of a committed fixture: real profiles of that schema exist.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("{} exists ({e}): fixtures are never rewritten", path.display()));
+        std::io::Write::write_all(&mut file, &blob).unwrap();
     }
 
+    /// The schema 6 file (1.0.0, 1.0.1) opens through the upgrade and comes
+    /// out at the current schema, its content intact and every server SSH.
     #[test]
     fn the_committed_fixture_vault_still_opens() {
-        let bytes = fs::read(FIXTURE_PATH).expect("testdata/vault-v2-schema6.solanum is missing");
-        let header = parse_vault_header(&bytes).unwrap();
-        assert_eq!(bytes[4], VAULT_VERSION, "fixture file format");
-        assert_eq!((header.kdf.m_cost, header.kdf.t_cost, header.kdf.p_cost), (ARGON2_M_COST_MIN, 1, 1));
-
-        // Through the real unlock path, on a copy (it writes a lock file and a backup).
-        let dir = std::env::temp_dir().join(format!("solanum-fixture-test-{:016x}", rand::thread_rng().gen::<u64>()));
-        fs::create_dir_all(&dir).unwrap();
-        let copy = dir.join("fixture.solanum");
-        fs::write(&copy, &bytes).unwrap();
-        let (conn, _vault) = match open_profile_vault(&copy, FIXTURE_PASSWORD, OpenMode::OpenOnly) {
-            Ok(v) => v,
-            Err(e) => panic!(
-                "the committed fixture vault no longer opens: {e}\n\
-                 Pre-release: regenerate it with `SOLANUM_REGENERATE_FIXTURE=1 cargo test --lib -- --ignored regenerate_fixture_vault`.\n\
-                 After the first release: write a migration instead (see SCHEMA_VERSION)."
-            ),
-        };
+        let (conn, _vault) = open_committed_fixture(FIXTURE_PATH);
         let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(one("SELECT COUNT(*) FROM servers WHERE connection_type = 'ssh'"), 3, "upgraded: every server is SSH");
         assert_eq!(one("SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key='schema_version'"), SCHEMA_VERSION);
         assert_eq!(one("SELECT COUNT(*) FROM servers"), 3);
         assert_eq!(one("SELECT COUNT(*) FROM folders WHERE parent_id = 1"), 1);
@@ -2258,8 +2684,22 @@ mod fixture_vault_tests {
         assert_eq!(one("SELECT COUNT(*) FROM servers WHERE terminal_only = 1"), 1);
         let jump = resolve_jump_auth(&conn, 1).unwrap().unwrap();
         assert_eq!((jump.host.as_str(), jump.legacy_algorithms), ("192.0.2.10", false));
-        assert_eq!(fs::read(sidecar_path(&copy, "bak")).unwrap(), bytes, "backup written on unlock");
-        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The schema 7 file: a serial server keeps its port and line settings.
+    #[test]
+    fn the_schema7_fixture_vault_opens() {
+        let (conn, _vault) = open_committed_fixture(FIXTURE_V7_PATH);
+        let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(one("SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key='schema_version'"), SCHEMA_VERSION);
+        assert_eq!(one("SELECT COUNT(*) FROM servers"), 4);
+        assert_eq!(one("SELECT COUNT(*) FROM servers WHERE connection_type = 'ssh'"), 3);
+        assert_eq!(one("SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+        let console = serial::settings_of_server(&conn, 4).unwrap();
+        assert_eq!(console.summary(), "115200 7E2 RTS/CTS");
+        assert_eq!(console.port, "COM3");
+        let run: String = conn.query_row("SELECT run_on_connect FROM servers WHERE id=4", [], |r| r.get(0)).unwrap();
+        assert_eq!(run, "show version");
     }
 }
 
@@ -3268,6 +3708,16 @@ struct ServerSave {
     legacy_algorithms: bool,
     #[serde(default)]
     terminal_only: bool,
+    /// `ssh` (the default) or `serial` (schema 7).
+    #[serde(default = "default_connection_type")]
+    connection_type: String,
+    /// A serial server's port and line settings; ignored for SSH.
+    #[serde(default)]
+    serial: Option<serial::SerialSettings>,
+}
+
+fn default_connection_type() -> String {
+    "ssh".into()
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3299,31 +3749,146 @@ fn server_write_error(e: rusqlite::Error) -> String {
     }
 }
 
-/// Checks a node and writes it, with all its settings, in one transaction.
-/// Returns its id and whether its tunnel rules changed.
-fn write_server_row(conn: &Connection, s: &ServerSave) -> Result<(i64, bool), String> {
-    checked_port(s.port, "Port")?;
-    let proxy_port = checked_proxy_port(&s.proxy_type, s.proxy_port)?;
-    check_tunnel_rows(&s.tunnels)?;
+/// A server row's values as stored, worked out once for the INSERT and the
+/// UPDATE of `write_server_row`.
+struct ServerRowValues<'a> {
+    host: &'a str,
+    port: i32,
+    proxy_type: &'a str,
+    proxy_host: &'a str,
+    proxy_port: i32,
+    tunnels_json: String,
+    mirrors_json: String,
+    auth_type: &'a str,
+    username: Option<String>,
+    password: Option<String>,
+    key_id: Option<i32>,
+    credential_id: Option<i32>,
+    jump_host_id: Option<i32>,
+    legacy_algorithms: bool,
+    terminal_only: bool,
+    connection_type: &'static str,
+    serial: serial::SerialSettings,
+}
+
+/// The settings a server row holds while it is not a serial one (PuTTY's
+/// defaults, as `SCHEMA_6_TO_7` writes them).
+fn unused_serial_settings() -> serial::SerialSettings {
+    serial::SerialSettings {
+        port: String::new(),
+        baud: serial::DEFAULT_BAUD,
+        data_bits: 8,
+        parity: serial::Parity::None,
+        stop_bits: 1,
+        flow: serial::Flow::None,
+    }
+}
+
+/// Checks a node and works out what its row holds. A serial server (schema
+/// 7) keeps its name, folder, colour, notes, commands run on connect and
+/// autostart; everything that belongs to SSH is cleared, and it may not be
+/// anyone's jump host. `listed`: the serial ports this system reports.
+fn server_row_values<'a>(conn: &Connection, s: &'a ServerSave, listed: &[String]) -> Result<ServerRowValues<'a>, String> {
     if s.id.is_some() && s.jump_host_id == s.id {
         return Err("A server cannot be its own jump host.".into()); // N-002
     }
-    let tunnels_json = serde_json::to_string(&s.tunnels).map_err(|e| format!("[DATABASE] SERIALIZE_FAILED: {}", e))?;
-    let mirrors_json = serde_json::to_string(&s.mirrors).map_err(|e| format!("[DATABASE] SERIALIZE_FAILED: {}", e))?;
-    // Enforce the "one source of truth" rule at write time: in vault mode the
-    // node row carries no identity at all; in custom_* mode the credential
-    // link is dropped.
-    let (db_username, db_password, db_key_id, db_credential_id) = normalize_server_identity(
-        &s.auth_type, s.username.clone(), s.password.clone(), s.key_id, s.credential_id,
-    );
+    match s.connection_type.as_str() {
+        "serial" => {
+            let settings = s.serial.clone().ok_or("A serial server needs a port and line settings.")?;
+            if let Some(problem) = settings.save_problem(listed) {
+                return Err(problem);
+            }
+            if let Some(id) = s.id {
+                let users: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM servers WHERE jump_host_id = ?1", [id], |r| r.get(0))
+                    .map_err(server_write_error)?;
+                if users > 0 {
+                    return Err("Other servers use this one as their jump host, so it cannot become a serial port.".into());
+                }
+                let monitored: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM monitor_configs WHERE node_id = ?1", [id], |r| r.get(0))
+                    .map_err(server_write_error)?;
+                if monitored > 0 {
+                    return Err("This server has a resource monitor: remove it before making it a serial port.".into());
+                }
+            }
+            Ok(ServerRowValues {
+                host: "",
+                port: 0,
+                proxy_type: "none",
+                proxy_host: "",
+                proxy_port: 1080,
+                tunnels_json: "[]".into(),
+                mirrors_json: "[]".into(),
+                auth_type: "custom_pass",
+                username: None,
+                password: None,
+                key_id: None,
+                credential_id: None,
+                jump_host_id: None,
+                legacy_algorithms: false,
+                terminal_only: false,
+                connection_type: "serial",
+                serial: settings,
+            })
+        }
+        "ssh" => {
+            checked_port(s.port, "Port")?;
+            let proxy_port = checked_proxy_port(&s.proxy_type, s.proxy_port)?;
+            check_tunnel_rows(&s.tunnels)?;
+            if let Some(jump) = s.jump_host_id {
+                if serial::is_serial_server(conn, jump as i64) {
+                    return Err("A serial port cannot be a jump host.".into());
+                }
+            }
+            let tunnels_json = serde_json::to_string(&s.tunnels).map_err(|e| format!("[DATABASE] SERIALIZE_FAILED: {}", e))?;
+            let mirrors_json = serde_json::to_string(&s.mirrors).map_err(|e| format!("[DATABASE] SERIALIZE_FAILED: {}", e))?;
+            // Enforce the "one source of truth" rule at write time: in vault mode the
+            // node row carries no identity at all; in custom_* mode the credential
+            // link is dropped.
+            let (username, password, key_id, credential_id) = normalize_server_identity(
+                &s.auth_type, s.username.clone(), s.password.clone(), s.key_id, s.credential_id,
+            );
+            Ok(ServerRowValues {
+                host: &s.host,
+                port: s.port,
+                proxy_type: &s.proxy_type,
+                proxy_host: &s.proxy_host,
+                proxy_port,
+                tunnels_json,
+                mirrors_json,
+                auth_type: &s.auth_type,
+                username,
+                password,
+                key_id,
+                credential_id,
+                jump_host_id: s.jump_host_id,
+                legacy_algorithms: s.legacy_algorithms,
+                terminal_only: s.terminal_only,
+                connection_type: "ssh",
+                serial: unused_serial_settings(),
+            })
+        }
+        other => Err(format!("Unknown connection type \"{}\".", open_guard::visible_text(other))),
+    }
+}
+
+/// Checks a node and writes it, with all its settings, in one transaction.
+/// Returns its id and whether its tunnel rules changed. `listed`: the serial
+/// ports this system reports (a serial server may name any of them).
+fn write_server_row(conn: &Connection, s: &ServerSave, listed: &[String]) -> Result<(i64, bool), String> {
+    let v = server_row_values(conn, s, listed)?;
+    let (db_username, db_password, db_key_id, db_credential_id) = (&v.username, &v.password, v.key_id, v.credential_id);
+    let (tunnels_json, mirrors_json, proxy_port) = (&v.tunnels_json, &v.mirrors_json, v.proxy_port);
     let autostart_i: i32 = if s.autostart { 1 } else { 0 };
+    let sp = &v.serial;
 
     let tx = conn.unchecked_transaction().map_err(server_write_error)?;
     let saved = match s.id {
         None => {
             tx.execute(
-                "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, legacy_algorithms, terminal_only) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-                rusqlite::params![s.name, s.host, s.port, db_username, db_password, db_credential_id, s.folder_id, s.proxy_type, s.proxy_host, proxy_port, tunnels_json, s.auth_type, db_key_id, autostart_i, mirrors_json, s.color, s.notes, s.run_on_connect, s.jump_host_id, s.legacy_algorithms, s.terminal_only],
+                "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, legacy_algorithms, terminal_only, connection_type, serial_port, serial_baud, serial_data_bits, serial_parity, serial_stop_bits, serial_flow) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                rusqlite::params![s.name, v.host, v.port, db_username, db_password, db_credential_id, s.folder_id, v.proxy_type, v.proxy_host, proxy_port, tunnels_json, v.auth_type, db_key_id, autostart_i, mirrors_json, s.color, s.notes, s.run_on_connect, v.jump_host_id, v.legacy_algorithms, v.terminal_only, v.connection_type, sp.port, sp.baud, sp.data_bits, sp.parity.as_str(), sp.stop_bits, sp.flow.as_str()],
             ).map_err(server_write_error)?;
             let new_id = tx.last_insert_rowid();
             // Append to the bottom of its folder's manual order: one past the
@@ -3348,10 +3913,11 @@ fn write_server_row(conn: &Connection, s: &ServerSave) -> Result<(i64, bool), St
             // COALESCE(?, password) so a NULL bind keeps the existing value. It
             // matters only for custom_pass: normalize_server_identity clears
             // the password for the other modes.
-            let password_sql = if s.preserve_password && s.auth_type == "custom_pass" { "COALESCE(?5, password)" } else { "?5" };
+            // A serial server keeps no password (`v.connection_type`).
+            let password_sql = if s.preserve_password && v.connection_type == "ssh" && s.auth_type == "custom_pass" { "COALESCE(?5, password)" } else { "?5" };
             tx.execute(
-                &format!("UPDATE servers SET name=?1, host=?2, port=?3, username=?4, password={password_sql}, credential_id=?6, folder_id=?7, proxy_type=?8, proxy_host=?9, proxy_port=?10, tunnels=?11, auth_type=?12, key_id=?13, autostart=?14, mirrors=?15, color=?16, notes=?17, run_on_connect=?18, jump_host_id=?19, legacy_algorithms=?20, terminal_only=?21 WHERE id=?22"),
-                rusqlite::params![s.name, s.host, s.port, db_username, db_password, db_credential_id, s.folder_id, s.proxy_type, s.proxy_host, proxy_port, tunnels_json, s.auth_type, db_key_id, autostart_i, mirrors_json, s.color, s.notes, s.run_on_connect, s.jump_host_id, s.legacy_algorithms, s.terminal_only, id],
+                &format!("UPDATE servers SET name=?1, host=?2, port=?3, username=?4, password={password_sql}, credential_id=?6, folder_id=?7, proxy_type=?8, proxy_host=?9, proxy_port=?10, tunnels=?11, auth_type=?12, key_id=?13, autostart=?14, mirrors=?15, color=?16, notes=?17, run_on_connect=?18, jump_host_id=?19, legacy_algorithms=?20, terminal_only=?21, connection_type=?22, serial_port=?23, serial_baud=?24, serial_data_bits=?25, serial_parity=?26, serial_stop_bits=?27, serial_flow=?28 WHERE id=?29"),
+                rusqlite::params![s.name, v.host, v.port, db_username, db_password, db_credential_id, s.folder_id, v.proxy_type, v.proxy_host, proxy_port, tunnels_json, v.auth_type, db_key_id, autostart_i, mirrors_json, s.color, s.notes, s.run_on_connect, v.jump_host_id, v.legacy_algorithms, v.terminal_only, v.connection_type, sp.port, sp.baud, sp.data_bits, sp.parity.as_str(), sp.stop_bits, sp.flow.as_str(), id],
             ).map_err(server_write_error)?;
             // Folder changed → re-append to the bottom of the destination
             // folder's manual order, or the row keeps its stale rank from the
@@ -3362,7 +3928,7 @@ fn write_server_row(conn: &Connection, s: &ServerSave) -> Result<(i64, bool), St
                     rusqlite::params![id, s.folder_id],
                 ).map_err(server_write_error)?;
             }
-            (id as i64, old_tunnels_json != tunnels_json)
+            (id as i64, old_tunnels_json != *tunnels_json)
         }
     };
     tx.commit().map_err(server_write_error)?;
@@ -3376,11 +3942,14 @@ async fn save_server(
     ssh_state: tauri::State<'_, SshState>,
     request: ServerSave,
 ) -> Result<ServerSaved, String> {
+    // The ports this system lists are accepted whatever their name; asked
+    // before the vault is locked, and only for a serial server.
+    let listed = if request.connection_type == "serial" { serial::listed_ports().await } else { Vec::new() };
     // The non-Send connection guard is dropped before the await below.
     let (id, tunnels_changed) = {
         let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        write_server_row(conn, &request)?
+        write_server_row(conn, &request, &listed)?
     };
     let persist_error = save_vault_internal(&state).err();
     // Forwarding rules changed → drop this server's live tunnel replay cache so
@@ -3451,6 +4020,8 @@ mod server_save_tests {
             jump_host_id: None,
             legacy_algorithms: false,
             terminal_only: false,
+            connection_type: "ssh".into(),
+            serial: None,
         }
     }
 
@@ -3470,14 +4041,14 @@ mod server_save_tests {
     #[test]
     fn a_new_node_is_written_with_every_setting_in_one_call() {
         let conn = vault();
-        let (bastion, _) = write_server_row(&conn, &node("bastion")).unwrap();
+        let (bastion, _) = write_server_row(&conn, &node("bastion"), &[]).unwrap();
         let mut n = node("db");
         n.notes = "runbook".into();
         n.run_on_connect = "uptime".into();
         n.jump_host_id = Some(bastion as i32);
         n.legacy_algorithms = true;
         n.tunnels = vec![json!({"type": "L", "local": "5432", "remote": "127.0.0.1:5432"})];
-        let (id, _) = write_server_row(&conn, &n).unwrap();
+        let (id, _) = write_server_row(&conn, &n, &[]).unwrap();
         let (name, pw, notes, run, jump, legacy, tunnels) = row(&conn, id);
         assert_eq!((name.as_str(), pw.as_deref(), notes.as_str(), run.as_str()), ("db", Some("pw-1"), "runbook", "uptime"));
         assert_eq!((jump, legacy), (Some(bastion), true));
@@ -3491,31 +4062,67 @@ mod server_save_tests {
         let read = |id: i64| -> bool { conn.query_row("SELECT terminal_only FROM servers WHERE id=?1", [id], |r| r.get(0)).unwrap() };
         let mut n = node("switch");
         n.terminal_only = true;
-        let (id, _) = write_server_row(&conn, &n).unwrap();
+        let (id, _) = write_server_row(&conn, &n, &[]).unwrap();
         assert!(read(id));
-        assert!(!read(write_server_row(&conn, &node("linux")).unwrap().0), "off by default");
+        assert!(!read(write_server_row(&conn, &node("linux"), &[]).unwrap().0), "off by default");
         clone_server_row(&conn, id as i32).unwrap();
         assert!(read(conn.last_insert_rowid()), "a copy keeps it");
         n.id = Some(id as i32);
         n.terminal_only = false;
-        write_server_row(&conn, &n).unwrap();
+        write_server_row(&conn, &n, &[]).unwrap();
         assert!(!read(id));
+    }
+
+    /// A clone copies every column of the server but the few it must not: a
+    /// serial server stays one, with its port and line settings. Every value
+    /// here differs from its column's default, or a column the clone forgot
+    /// would still read the same; a column added later needs a value here.
+    #[test]
+    fn a_clone_copies_every_column_but_its_identity() {
+        let conn = vault();
+        let mut n = serial_node("console", "/dev/ttyUSB0");
+        n.serial = Some(serial::SerialSettings {
+            port: "/dev/ttyUSB0".into(),
+            baud: 115_200,
+            data_bits: 7,
+            parity: serial::Parity::Even,
+            stop_bits: 2,
+            flow: serial::Flow::RtsCts,
+        });
+        n.run_on_connect = "show version".into();
+        n.notes = "rack 4".into();
+        n.color = Some("#ff0000".into());
+        let (id, _) = write_server_row(&conn, &n, &[]).unwrap();
+        let copy = clone_server_row(&conn, id as i32).unwrap();
+        const CHANGED: &[&str] = &["id", "name", "autostart", "position", "pinned_at"];
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('servers')").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        assert!(columns.iter().any(|c| c == "serial_flow"), "{columns:?}");
+        for column in columns.iter().filter(|c| !CHANGED.contains(&c.as_str())) {
+            let same: bool = conn
+                .query_row(&format!("SELECT a.\"{column}\" IS b.\"{column}\" FROM servers a, servers b WHERE a.id = ?1 AND b.id = ?2"), [id, copy], |r| r.get(0))
+                .unwrap();
+            assert!(same, "the clone lost {column}");
+        }
+        assert_eq!(serial::settings_of_server(&conn, copy).unwrap().summary(), "115200 7E2 RTS/CTS");
     }
 
     #[test]
     fn an_edit_keeps_the_password_when_asked_and_reports_changed_rules() {
         let conn = vault();
-        let (id, _) = write_server_row(&conn, &node("web")).unwrap();
+        let (id, _) = write_server_row(&conn, &node("web"), &[]).unwrap();
         let mut n = node("web2");
         n.id = Some(id as i32);
         n.password = None;
         n.preserve_password = true;
-        assert_eq!(write_server_row(&conn, &n).unwrap(), (id, false));
+        assert_eq!(write_server_row(&conn, &n, &[]).unwrap(), (id, false));
         assert_eq!(row(&conn, id).1.as_deref(), Some("pw-1"));
         n.tunnels = vec![json!({"type": "D", "local": "1080"})];
-        assert_eq!(write_server_row(&conn, &n).unwrap(), (id, true));
+        assert_eq!(write_server_row(&conn, &n, &[]).unwrap(), (id, true));
         n.preserve_password = false;
-        write_server_row(&conn, &n).unwrap();
+        write_server_row(&conn, &n, &[]).unwrap();
         assert_eq!(row(&conn, id).1, None);
     }
 
@@ -3528,10 +4135,10 @@ mod server_save_tests {
             json!({"type": "L", "local": "8080", "remote": "127.0.0.1:80"}),
             json!({"type": "L", "local": "8081", "remote": "intranet"}),
         ];
-        let err = write_server_row(&conn, &n).unwrap_err();
+        let err = write_server_row(&conn, &n, &[]).unwrap_err();
         assert!(err.starts_with("Tunnel rule 2 (L 8081)"), "{err}");
         n.tunnels = vec![json!({"type": "L"})];
-        assert!(write_server_row(&conn, &n).unwrap_err().starts_with("Tunnel rule 1:"));
+        assert!(write_server_row(&conn, &n, &[]).unwrap_err().starts_with("Tunnel rule 1:"));
         assert_eq!(count(&conn), 0);
     }
 
@@ -3539,11 +4146,11 @@ mod server_save_tests {
     #[test]
     fn a_server_is_not_its_own_jump_host() {
         let conn = vault();
-        let (id, _) = write_server_row(&conn, &node("web")).unwrap();
+        let (id, _) = write_server_row(&conn, &node("web"), &[]).unwrap();
         let mut n = node("web");
         n.id = Some(id as i32);
         n.jump_host_id = Some(id as i32);
-        assert_eq!(write_server_row(&conn, &n).unwrap_err(), "A server cannot be its own jump host.");
+        assert_eq!(write_server_row(&conn, &n, &[]).unwrap_err(), "A server cannot be its own jump host.");
         assert_eq!(row(&conn, id).4, None);
     }
 
@@ -3552,12 +4159,12 @@ mod server_save_tests {
     #[test]
     fn a_missing_jump_host_or_login_changes_nothing() {
         let conn = vault();
-        let (id, _) = write_server_row(&conn, &node("web")).unwrap();
+        let (id, _) = write_server_row(&conn, &node("web"), &[]).unwrap();
         let mut n = node("renamed");
         n.id = Some(id as i32);
         n.notes = "new notes".into();
         n.jump_host_id = Some(4242);
-        let err = write_server_row(&conn, &n).unwrap_err();
+        let err = write_server_row(&conn, &n, &[]).unwrap_err();
         assert!(err.contains("no longer exists"), "{err}");
         let (name, _, notes, ..) = row(&conn, id);
         assert_eq!((name.as_str(), notes.as_str()), ("web", ""));
@@ -3566,7 +4173,7 @@ mod server_save_tests {
         fresh.auth_type = "vault".into();
         fresh.credential_id = Some(77);
         fresh.notes = "x".into();
-        assert!(write_server_row(&conn, &fresh).unwrap_err().contains("no longer exists"));
+        assert!(write_server_row(&conn, &fresh, &[]).unwrap_err().contains("no longer exists"));
         assert_eq!(count(&conn), 1);
     }
 
@@ -3575,14 +4182,14 @@ mod server_save_tests {
         let conn = vault();
         let mut n = node("ghost");
         n.id = Some(9);
-        assert_eq!(write_server_row(&conn, &n).unwrap_err(), "This server no longer exists.");
+        assert_eq!(write_server_row(&conn, &n, &[]).unwrap_err(), "This server no longer exists.");
         let mut p = node("p");
         p.port = 70000;
-        assert!(write_server_row(&conn, &p).is_err());
+        assert!(write_server_row(&conn, &p, &[]).is_err());
         let mut q = node("q");
         q.proxy_type = "socks5".into();
         q.proxy_port = 0;
-        assert!(write_server_row(&conn, &q).is_err());
+        assert!(write_server_row(&conn, &q, &[]).is_err());
         assert_eq!(count(&conn), 0);
     }
 
@@ -3598,6 +4205,131 @@ mod server_save_tests {
         .unwrap();
         assert!(n.preserve_password && n.autostart && n.legacy_algorithms && n.terminal_only);
         assert_eq!((n.run_on_connect.as_str(), n.jump_host_id), ("r", Some(3)));
+        assert_eq!((n.connection_type.as_str(), n.serial.is_none()), ("ssh", true), "an older window's request is SSH");
+    }
+
+    fn serial_node(name: &str, port: &str) -> ServerSave {
+        let mut n = node(name);
+        n.connection_type = "serial".into();
+        n.serial = Some(serial::SerialSettings {
+            port: port.into(),
+            baud: 115_200,
+            data_bits: 8,
+            parity: serial::Parity::None,
+            stop_bits: 1,
+            flow: serial::Flow::None,
+        });
+        n
+    }
+
+    /// A serial server keeps its port, line settings and what belongs to any
+    /// server (name, notes, commands run on connect, autostart); everything
+    /// of SSH is cleared, whatever the form sent.
+    #[test]
+    fn a_serial_server_keeps_its_settings_and_nothing_of_ssh() {
+        let conn = vault();
+        let (bastion, _) = write_server_row(&conn, &node("bastion"), &[]).unwrap();
+        let mut n = serial_node("console", "COM3");
+        n.password = Some("pw-1".into());
+        n.tunnels = vec![json!({"type": "L", "local": "5432", "remote": "127.0.0.1:5432"})];
+        n.jump_host_id = Some(bastion as i32);
+        n.legacy_algorithms = true;
+        n.terminal_only = true;
+        n.notes = "rack 4".into();
+        n.run_on_connect = "show version".into();
+        n.autostart = true;
+        let (id, _) = write_server_row(&conn, &n, &[]).unwrap();
+        assert_eq!(serial::settings_of_server(&conn, id).unwrap().summary(), "115200 8N1");
+        assert_eq!(row(&conn, id), ("console".into(), None, "rack 4".into(), "show version".into(), None, false, "[]".into()));
+        let rest: (String, i64, Option<String>, String, String, i64, i64) = conn
+            .query_row(
+                "SELECT host, port, username, proxy_type, mirrors, terminal_only, autostart FROM servers WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!(rest, (String::new(), 0, None, "none".into(), "[]".into(), 0, 1));
+        assert!(serial::is_serial_server(&conn, id) && !serial::is_serial_server(&conn, bastion));
+    }
+
+    /// Edited back and forth: an SSH server turned serial loses its password
+    /// even when the form asks to keep it, and turned SSH again it gets
+    /// PuTTY's defaults back in the serial columns.
+    #[test]
+    fn a_server_can_change_kind_and_keeps_nothing_of_the_other() {
+        let conn = vault();
+        let (id, _) = write_server_row(&conn, &node("web"), &[]).unwrap();
+        let mut n = serial_node("web", "/dev/ttyUSB0");
+        n.id = Some(id as i32);
+        n.preserve_password = true;
+        n.password = None;
+        write_server_row(&conn, &n, &[]).unwrap();
+        assert_eq!(row(&conn, id).1, None, "no password stays on a serial server");
+        let mut back = node("web");
+        back.id = Some(id as i32);
+        write_server_row(&conn, &back, &[]).unwrap();
+        assert!(!serial::is_serial_server(&conn, id));
+        let kept: (String, i64) = conn.query_row("SELECT serial_port, serial_baud FROM servers WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(kept, (String::new(), 9600));
+    }
+
+    #[test]
+    fn a_serial_server_is_never_a_jump_host() {
+        let conn = vault();
+        let (console, _) = write_server_row(&conn, &serial_node("console", "COM3"), &[]).unwrap();
+        let mut n = node("behind");
+        n.jump_host_id = Some(console as i32);
+        assert_eq!(write_server_row(&conn, &n, &[]).unwrap_err(), "A serial port cannot be a jump host.");
+
+        // Nor may a jump host, or a monitored server, become a serial port.
+        let (bastion, _) = write_server_row(&conn, &node("bastion"), &[]).unwrap();
+        let mut behind = node("behind");
+        behind.jump_host_id = Some(bastion as i32);
+        write_server_row(&conn, &behind, &[]).unwrap();
+        let mut turned = serial_node("bastion", "COM3");
+        turned.id = Some(bastion as i32);
+        assert!(write_server_row(&conn, &turned, &[]).unwrap_err().contains("jump host"));
+        let (watched, _) = write_server_row(&conn, &node("watched"), &[]).unwrap();
+        conn.execute("INSERT INTO monitor_configs(node_id) VALUES (?1)", [watched]).unwrap();
+        let mut turned = serial_node("watched", "COM3");
+        turned.id = Some(watched as i32);
+        assert!(write_server_row(&conn, &turned, &[]).unwrap_err().contains("monitor"));
+    }
+
+    #[test]
+    fn serial_settings_are_checked_when_saved() {
+        let conn = vault();
+        for port in ["", "/etc/passwd", "/dev/sda", r"\\.\PhysicalDrive0", "CNCA0"] {
+            assert!(write_server_row(&conn, &serial_node("x", port), &[]).is_err(), "{port:?}");
+        }
+        assert!(write_server_row(&conn, &serial_node("x", "CNCA0"), &["CNCA0".to_string()]).is_ok(), "a port this system lists");
+        let mut slow = serial_node("x", "COM3");
+        slow.serial.as_mut().unwrap().baud = 10;
+        assert!(write_server_row(&conn, &slow, &[]).is_err());
+        let mut missing = serial_node("x", "COM3");
+        missing.serial = None;
+        assert!(write_server_row(&conn, &missing, &[]).unwrap_err().contains("port"));
+        let mut odd = node("x");
+        odd.connection_type = "telnet".into();
+        assert!(write_server_row(&conn, &odd, &[]).unwrap_err().contains("Unknown connection type"));
+    }
+
+    /// The paths that only make sense for SSH refuse a serial server, also
+    /// one a hand-edited vault holds where it should not be; and settings
+    /// read back are checked again.
+    #[test]
+    fn the_ssh_only_paths_refuse_a_serial_server() {
+        let conn = vault();
+        let (console, _) = write_server_row(&conn, &serial_node("console", "COM3"), &[]).unwrap();
+        let (web, _) = write_server_row(&conn, &node("web"), &[]).unwrap();
+        assert!(resolve_jump_auth(&conn, console as i32).err().unwrap().contains("serial port"));
+        assert!(resolve_node_auth_for_monitor(&conn, console as i32).err().unwrap().contains("serial port"));
+        assert!(serial::settings_of_server(&conn, web).unwrap_err().contains("NOT_SERIAL"));
+        assert!(serial::settings_of_server(&conn, 999).unwrap_err().contains("NOT_FOUND"));
+        conn.execute("UPDATE servers SET serial_parity='mark' WHERE id=?1", [console]).unwrap();
+        assert!(serial::settings_of_server(&conn, console).unwrap_err().contains("SETTINGS_REFUSED"));
+        conn.execute("UPDATE servers SET serial_parity='none', serial_baud=-1 WHERE id=?1", [console]).unwrap();
+        assert!(serial::settings_of_server(&conn, console).unwrap_err().contains("SETTINGS_REFUSED"));
     }
 }
 
@@ -3818,8 +4550,8 @@ async fn clone_server(state: tauri::State<'_, DbState>, id: i32) -> Result<i64, 
 /// The row behind `clone_server`.
 fn clone_server_row(conn: &Connection, id: i32) -> Result<i64, String> {
     let affected = conn.execute(
-        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, legacy_algorithms, terminal_only)
-         SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, legacy_algorithms, terminal_only
+        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, legacy_algorithms, terminal_only, connection_type, serial_port, serial_baud, serial_data_bits, serial_parity, serial_stop_bits, serial_flow)
+         SELECT name || ' (copy)', host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, 0, mirrors, color, notes, run_on_connect, jump_host_id, legacy_algorithms, terminal_only, connection_type, serial_port, serial_baud, serial_data_bits, serial_parity, serial_stop_bits, serial_flow
          FROM servers WHERE id = ?1",
         rusqlite::params![id],
     ).map_err(|e| format!("[DATABASE] SERVER_CLONE_FAILED: {}", e))?;
@@ -3883,11 +4615,26 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
     // ORDER BY (position, id): `position` is the manual drag-to-reorder rank
     // (default 0 for never-reordered rows), and id breaks ties so the order is
     // stable and, before any reorder, identical to the old rowid order.
-    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, position, pinned_at, legacy_algorithms, terminal_only FROM servers ORDER BY position, id")
+    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors, color, notes, run_on_connect, jump_host_id, position, pinned_at, legacy_algorithms, terminal_only, connection_type, serial_port, serial_baud, serial_data_bits, serial_parity, serial_stop_bits, serial_flow FROM servers ORDER BY position, id")
         .map_err(|e| format!("[DATABASE] PREPARE_FAILED: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
         let pw: Option<String> = row.get::<_, Option<String>>(5)?;
+        let connection_type: String = row.get(24)?;
+        // As `serial::SerialSettings` (camelCase), so the form can send it back
+        // unchanged; null for an SSH server.
+        let serial = if connection_type == "serial" {
+            json!({
+                "port": row.get::<_, String>(25)?,
+                "baud": row.get::<_, i64>(26)?,
+                "dataBits": row.get::<_, i64>(27)?,
+                "parity": row.get::<_, String>(28)?,
+                "stopBits": row.get::<_, i64>(29)?,
+                "flow": row.get::<_, String>(30)?,
+            })
+        } else {
+            serde_json::Value::Null
+        };
         Ok(json!({
             "id": row.get::<_, i32>(0)?,
             "name": row.get::<_, String>(1)?,
@@ -3916,6 +4663,8 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             "pinned_at": row.get::<_, Option<i64>>(21)?,
             "legacy_algorithms": row.get::<_, i64>(22)? != 0,
             "terminal_only": row.get::<_, i64>(23)? != 0,
+            "connection_type": connection_type,
+            "serial": serial,
         }))
     }).map_err(|e| format!("[DATABASE] QUERY_MAPPING_FAILED: {}", e))?;
 
@@ -4728,6 +5477,10 @@ struct JumpIdentity {
 }
 
 fn resolve_jump_auth(conn: &rusqlite::Connection, server_id: i32) -> Result<Option<JumpIdentity>, String> {
+    // `save_server` refuses a serial jump host; a hand-edited vault could still hold one.
+    if serial::is_serial_server(conn, server_id as i64) {
+        return Err("This server's jump host is a serial port: choose another jump host.".into());
+    }
     let mut stmt = conn
         .prepare(
             "
@@ -5321,7 +6074,11 @@ async fn initiate_connection(
     {
         let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        
+        // A serial server is opened as a serial terminal, never connected to.
+        if serial::is_serial_server(conn, server_id as i64) {
+            return Err(serial::NOT_SSH.into());
+        }
+
         // Pull both server-side and credential-side identity fields separately
         // and resolve in Rust. The previous COALESCE was order-of-precedence
         // magic that hid the actual rule from anyone reading the SQL — now the
@@ -10367,6 +11124,10 @@ fn resolve_node_auth_for_monitor(
     conn: &rusqlite::Connection,
     node_id: i32,
 ) -> Result<monitor::NodeAuth, String> {
+    // Adding a monitor and every poll come through here.
+    if serial::is_serial_server(conn, node_id as i64) {
+        return Err("A serial port cannot be monitored.".into());
+    }
     let mut stmt = conn.prepare("
         SELECT s.host, s.port,
                s.username, c.username,
@@ -11169,6 +11930,7 @@ pub fn run() {
             docker::open_container_terminal,
             local_shell::list_local_shells,
             local_shell::open_local_terminal,
+            serial::list_serial_ports, serial::open_serial_terminal, serial::serial_send_break,
             select_local_folder, select_local_files, local_path_is_dir, local_list_dir,
             local_home_dir, local_desktop_dir, local_create_dir, local_remove, local_rename,
             android_quick_dirs, android_default_local_dir, android::android_keep_alive,

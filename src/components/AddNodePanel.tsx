@@ -5,6 +5,8 @@ import { Cpu, X, ArrowLeftRight, User, FolderPlus, Download, CheckSquare, Square
 import PasswordField from "./PasswordField";
 import { exposureWarning, listensBeyondLoopback } from "../util/tunnelBind";
 import { IS_ANDROID } from "../util/platform";
+import SerialPortFields from "./SerialPortFields";
+import { isSerialServer } from "../util/serialSettings";
 
 // Shape returned by the `parse_ssh_config` backend command. One entry per
 // non-wildcard alias resolved from the user's OpenSSH config.
@@ -19,6 +21,9 @@ type ImportedHost = {
 
 const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, sshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile }: any) => {
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
+  // A serial server (COM port or /dev tty, schema 7): the SSH-only parts of
+  // the form are hidden, and Rust clears them when saving whatever is sent.
+  const isSerial = newNode.connectionType === "serial";
   const [newFolderName, setNewFolderName] = useState("");
   const [folderError, setFolderError] = useState<string | null>(null);
 
@@ -231,7 +236,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 existing server is a rename/reconfigure flow, not an import.
                 Available on Android too, where the window offers only the
                 "Paste PuTTY / MobaXterm / JSON" source (no ~/.ssh/config). */}
-            {!isEditMode && (
+            {!isEditMode && !isSerial && (
               <button
                 onClick={openImportModal}
                 title="Import hosts from an OpenSSH config (~/.ssh/config), PuTTY (.reg export), MobaXterm (.mxtsessions) or a JSON list"
@@ -250,6 +255,31 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
         {/* Scrollable Content */}
         <div className="p-6 flex-1 overflow-y-auto custom-scrollbar space-y-6">
           {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
+
+          {/* SSH or a serial port. Serial is desktop only (owner decision
+              2026-11-13); on Android a serial server made on a computer
+              still shows what it is, without the choice. */}
+          {(!IS_ANDROID || isSerial) && (
+            <div className="flex items-center gap-1 p-1 bg-[#1a1a1e] rounded-lg border border-white/10 w-fit" role="radiogroup" aria-label="Connection">
+              {(["ssh", "serial"] as const).map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  role="radio"
+                  aria-checked={newNode.connectionType === kind}
+                  disabled={IS_ANDROID}
+                  onClick={() => setNewNode({ ...newNode, connectionType: kind })}
+                  className={`h-7 px-3 rounded-md text-[10.5px] font-bold uppercase tracking-wider transition-all ${
+                    newNode.connectionType === kind
+                      ? "bg-primary/15 text-primary border border-primary/30"
+                      : "text-zinc-400 border border-transparent hover:text-white hover:bg-white/[0.04]"
+                  }`}
+                >
+                  {kind === "ssh" ? "SSH" : "Serial"}
+                </button>
+              ))}
+            </div>
+          )}
 
           <div className="grid grid-cols-1 gap-4">
             <div className="space-y-1.5">
@@ -306,6 +336,14 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </div>
             </div>
 
+            {isSerial ? (
+              <SerialPortFields
+                value={newNode.serial}
+                onChange={(serial) => setNewNode({ ...newNode, serial })}
+                inputClass="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner"
+                labelClass="text-[11px] font-bold text-zinc-400 ml-1"
+              />
+            ) : (
             <div className="grid grid-cols-4 gap-4">
               <div className="col-span-3 space-y-1.5">
                 <label className="text-[11px] font-bold text-zinc-400 ml-1">Host</label>
@@ -316,9 +354,12 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 <input type="number" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={Number.isNaN(newNode.port) ? "" : newNode.port} onChange={e => setNewNode({ ...newNode, port: parseInt(e.target.value, 10) })} />
               </div>
             </div>
+            )}
 
           </div>
 
+          {/* How to log in: SSH only. */}
+          {!isSerial && (
           <div className="pt-5 border-t border-white/5 space-y-4">
             <div className="flex justify-between items-center">
               <label className="text-[11px] font-bold text-zinc-400">How to log in</label>
@@ -390,8 +431,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </div>
             )}
           </div>
+          )}
 
           <div className="pt-5 border-t border-white/5 space-y-4">
+            {/* Proxy, jump host, algorithms, terminal only, tunnels and mirrors belong to SSH. */}
+            {!isSerial && (<>
             <div className="flex justify-between items-center">
               <label className="text-[11px] font-bold text-zinc-400">Proxy</label>
               <select className="bg-transparent text-[12px] font-bold text-zinc-300 outline-none cursor-pointer" value={newNode.proxyType} onChange={e => setNewNode({ ...newNode, proxyType: e.target.value })}>
@@ -433,7 +477,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               >
                 <option value="" className="bg-[#1a1a1e] text-zinc-500">Direct — no jump host</option>
                 {(servers || [])
-                  .filter((s: any) => s.id !== newNode.id)
+                  .filter((s: any) => s.id !== newNode.id && !isSerialServer(s))
                   .map((s: any) => (
                     <option key={s.id} value={s.id.toString()} className="bg-[#1a1a1e] text-zinc-300">
                       {s.name} ({s.host})
@@ -657,6 +701,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </div>
             </div>
             )}
+            </>)}
 
             {/* Autostart toggle — when on, the node opens a session and
                 connects automatically right after the user unlocks the
@@ -666,7 +711,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               <div className="min-w-0">
                 <div className="text-[11px] font-bold text-zinc-300">Autostart</div>
                 <div className="text-[10.5px] text-zinc-500 leading-snug">
-                  Open + connect this node automatically when the app launches.
+                  {isSerial
+                    ? "Open this port automatically when the app launches."
+                    : "Open + connect this node automatically when the app launches."}
                 </div>
               </div>
               <button
